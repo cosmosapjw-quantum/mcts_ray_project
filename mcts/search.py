@@ -11,8 +11,7 @@ def mcts_worker(root_state, inference_actor, num_simulations):
         if node.state.is_terminal():
             value = node.state.winner
         else:
-            priors, values = ray.get(inference_actor.infer.remote([node.state]))
-            expand(node, priors[0])
-            value = values[0][0]
+            priors, value = ray.get(inference_actor.infer.remote(node.state))
+            expand(node, priors)  # pass priors directly
         backpropagate(node, value)
     return root

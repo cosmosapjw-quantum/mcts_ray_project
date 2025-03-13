@@ -7,7 +7,9 @@ def select(node):
     return node
 
 def expand(node, priors):
-    for action, prior in zip(node.state.get_legal_actions(), priors):
+    actions = node.state.get_legal_actions()
+    priors_for_actions = [priors[a] for a in actions]  # align priors with actions
+    for action, prior in zip(actions, priors):
         child = Node(node.state.apply_action(action), node)
         child.prior = prior
         node.children.append(child)
