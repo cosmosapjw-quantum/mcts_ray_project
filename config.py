@@ -1,0 +1,5 @@
+# config.py
+RAY_ADDRESS = 'auto'
+VERBOSE = True
+NUM_SIMULATIONS = 20
+NUM_WORKERS = 4
