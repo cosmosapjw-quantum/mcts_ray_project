@@ -15,7 +15,7 @@ model = SmallResNet()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # Launch inference server
-inference_actor = InferenceServer.remote()
+inference_actor = InferenceServer.remote(batch_wait=0.02)
 
 # Self-play loop
 def self_play_episode():
@@ -23,17 +23,24 @@ def self_play_episode():
     memory = []
 
     while not state.is_terminal():
-        root = ray.get(mcts_worker.remote(state, inference_actor, NUM_SIMULATIONS))
-        visits = torch.tensor([child.visits for child in root.children])
+        # Perform multiple parallel MCTS searches
+        roots = ray.get([
+            mcts_worker.remote(state, inference_actor, NUM_SIMULATIONS)
+            for _ in range(NUM_WORKERS)
+        ])
 
-        full_policy = torch.zeros(9)
-        legal_actions = state.get_legal_actions()
-        full_policy[legal_actions] = visits.float() / visits.sum()
-        policy = full_policy
+        # Aggregate visit counts from multiple MCTS runs
+        combined_visits = torch.zeros(9)
+        for root in roots:
+            for child in root.children:
+                action = [i for i, (s1, s2) in enumerate(zip(state.board, child.state.board)) if s1 != s2][0]
+                combined_visits[action] += child.visits
+
+        policy = combined_visits / combined_visits.sum()
 
         if VERBOSE:
-            print(f"State: {state.board}")
-            print(f"Policy distribution: {policy}")
+            print(f"Current State: {state.board}")
+            print(f"Aggregated Policy Distribution: {policy}")
 
         action = torch.multinomial(policy, 1).item()
         state_tensor = torch.tensor(state.board).float()
@@ -41,7 +48,7 @@ def self_play_episode():
         memory.append((state_tensor, policy, state.current_player))
 
         if VERBOSE:
-            print(f"Chosen action: {action}")
+            print(f"Chosen Action: {action}")
 
         state = state.apply_action(action)
 
@@ -50,6 +57,7 @@ def self_play_episode():
     if VERBOSE:
         print(f"Game outcome: {outcome}")
 
+    # Training from game memory
     for state_tensor, policy, player in memory:
         target_value = torch.tensor([1.0 if outcome == player else -1.0 if outcome else 0])
         predicted_policy, predicted_value = model(state_tensor)
@@ -59,7 +67,7 @@ def self_play_episode():
         loss = loss_policy + loss_value
 
         if VERBOSE:
-            print(f"Policy loss: {loss_policy.item()}, Value loss: {loss_value.item()}, Total loss: {loss.item()}")
+            print(f"Policy Loss: {loss_policy.item()}, Value Loss: {loss_value.item()}, Total Loss: {loss.item()}")
 
         optimizer.zero_grad()
         loss.backward()
