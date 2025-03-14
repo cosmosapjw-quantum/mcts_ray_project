@@ -6,7 +6,7 @@ from inference.inference_server import InferenceServer
 from utils.state_utils import TicTacToeState
 from mcts.search import mcts_worker
 from model import SmallResNet
-from config import NUM_SIMULATIONS, NUM_WORKERS, VERBOSE
+from config import NUM_SIMULATIONS, NUM_WORKERS, SIMULATIONS_PER_WORKER, VERBOSE
 
 ray.init()
 
@@ -17,30 +17,34 @@ optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 # Launch inference server
 inference_actor = InferenceServer.remote(batch_wait=0.02)
 
+def prev_board_differs(old_board, new_board, index):
+    return old_board[index] != new_board[index]
+
 # Self-play loop
 def self_play_episode():
     state = TicTacToeState()
     memory = []
 
     while not state.is_terminal():
-        # Perform multiple parallel MCTS searches
         roots = ray.get([
-            mcts_worker.remote(state, inference_actor, NUM_SIMULATIONS)
+            mcts_worker.remote(state, inference_actor, NUM_SIMULATIONS * SIMULATIONS_PER_WORKER)
             for _ in range(NUM_WORKERS)
         ])
 
-        # Aggregate visit counts from multiple MCTS runs
+        # Aggregate visit counts across workers
         combined_visits = torch.zeros(9)
         for root in roots:
             for child in root.children:
-                action = [i for i, (s1, s2) in enumerate(zip(state.board, child.state.board)) if s1 != s2][0]
-                combined_visits[action] += child.visits
+                action = [i for i, (prev, new) in enumerate(zip(state.board, child.state.board)) if prev_board_differs(state.board, child.state.board, i)]
+                combined_action = action[0] if action else None
+                if combined_action is not None:
+                    combined_visits[combined_action] += child.visits
 
         policy = combined_visits / combined_visits.sum()
 
         if VERBOSE:
-            print(f"Current State: {state.board}")
-            print(f"Aggregated Policy Distribution: {policy}")
+            print(f"State: {state.board}")
+            print(f"Batched policy distribution: {policy}")
 
         action = torch.multinomial(policy, 1).item()
         state_tensor = torch.tensor(state.board).float()
@@ -48,7 +52,7 @@ def self_play_episode():
         memory.append((state_tensor, policy, state.current_player))
 
         if VERBOSE:
-            print(f"Chosen Action: {action}")
+            print(f"Chosen action: {action}")
 
         state = state.apply_action(action)
 
@@ -57,7 +61,6 @@ def self_play_episode():
     if VERBOSE:
         print(f"Game outcome: {outcome}")
 
-    # Training from game memory
     for state_tensor, policy, player in memory:
         target_value = torch.tensor([1.0 if outcome == player else -1.0 if outcome else 0])
         predicted_policy, predicted_value = model(state_tensor)
@@ -67,7 +70,7 @@ def self_play_episode():
         loss = loss_policy + loss_value
 
         if VERBOSE:
-            print(f"Policy Loss: {loss_policy.item()}, Value Loss: {loss_value.item()}, Total Loss: {loss.item()}")
+            print(f"Policy loss: {loss_policy.item()}, Value loss: {loss_value.item()}, Total loss: {loss.item()}")
 
         optimizer.zero_grad()
         loss.backward()

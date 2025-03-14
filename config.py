@@ -1,5 +1,6 @@
 # config.py
 RAY_ADDRESS = 'auto'
 VERBOSE = True
-NUM_SIMULATIONS = 20
-NUM_WORKERS = 4
+NUM_SIMULATIONS = 20          # base simulations per batch
+SIMULATIONS_PER_WORKER = 5    # multiplier for each worker
+NUM_WORKERS = 2
