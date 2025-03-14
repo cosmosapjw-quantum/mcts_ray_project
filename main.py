@@ -16,7 +16,7 @@ model = SmallResNet()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # Launch inference server
-inference_actor = InferenceServer.remote(batch_wait=0.02)
+inference_actor = InferenceServer.remote(batch_wait=0.05)
 
 writer = SummaryWriter(log_dir='runs/experiment1')
 
@@ -85,7 +85,7 @@ def self_play_episode(episode_num):
     writer.add_scalar('Game Outcome', outcome, episode_num)
 
 # Run self-play episodes
-for episode in range(100):
+for episode in range(5):
     if VERBOSE:
         print(f"Starting episode {episode + 1}")
     self_play_episode(episode)
