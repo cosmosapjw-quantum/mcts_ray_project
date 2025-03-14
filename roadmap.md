@@ -72,11 +72,3 @@
 | 5️⃣      | **Distributed Computing with Ray**          |
 | 6️⃣      | **TensorBoard Integration**                 |
 | 7️⃣      | **Advanced exploration strategies**         |
-
----
-
-### 🎯 **Next Immediate Steps (highly recommended):**
-
-- **Dynamic batching**: significantly improves GPU utilization.
-- **Self-play training pipeline**: crucial for model improvement.
-- **Profiling and optimization**: to identify and eliminate performance bottlenecks.
