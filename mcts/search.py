@@ -3,19 +3,6 @@ import ray
 import numpy as np
 from mcts.node import Node
 
-# Simple Node class if you need to update it
-# class Node:
-#    __slots__ = ('state', 'parent', 'children', 'visits', 'value', 'prior', 'action')
-#    
-#    def __init__(self, state, parent=None, prior=0.0, action=None):
-#        self.state = state
-#        self.parent = parent
-#        self.children = []
-#        self.visits = 0
-#        self.value = 0.0
-#        self.prior = prior
-#        self.action = action
-
 def select_node(node, exploration_weight=1.0):
     """Select a leaf node from the tree using PUCT algorithm"""
     path = [node]
@@ -92,47 +79,89 @@ def backpropagate(path, value):
         value = -value
 
 @ray.remote
-def mcts_search(root_state, inference_actor, num_simulations, exploration_weight=1.0):
-    """Perform MCTS search from root state"""
-    # Create root node
-    root = Node(root_state)
+class BatchMCTSWorker:
+    """MCTS worker that processes leaves in batches using direct batch inference"""
     
-    # Get initial policy and value for root
-    policy, value = ray.get(inference_actor.infer.remote(root_state))
+    def __init__(self, inference_actor, batch_size=32, exploration_weight=1.0):
+        self.inference_actor = inference_actor
+        self.batch_size = batch_size
+        self.exploration_weight = exploration_weight
     
-    # Expand root with initial policy
-    expand_node(root, policy, add_noise=True)
-    root.value = value
-    root.visits = 1
-    
-    # Run simulations
-    for _ in range(num_simulations):
-        # Select a leaf node
-        leaf, path = select_node(root, exploration_weight)
+    def search(self, root_state, num_simulations, add_noise=True):
+        """Perform MCTS search from root state with truly batched leaf evaluation"""
+        # Create root node
+        root = Node(root_state)
         
-        # Evaluate leaf
-        if leaf.state.is_terminal():
-            # Use game result if terminal
-            value = leaf.state.winner if leaf.state.winner is not None else 0
-        else:
-            # Otherwise use neural network
-            policy, value = ray.get(inference_actor.infer.remote(leaf.state))
-            # Expand the leaf node
-            expand_node(leaf, policy)
+        # First get root expansion without batching
+        policy, value = ray.get(self.inference_actor.infer.remote(root_state))
         
-        # Backpropagate value
-        backpropagate(path, value)
-    
-    return root
+        # Expand root with initial policy
+        expand_node(root, policy, add_noise=add_noise)
+        root.value = value
+        root.visits = 1
+        
+        # Run simulations in batches
+        sims_completed = 1  # Count root evaluation
+        
+        while sims_completed < num_simulations:
+            # How many simulations to run in this batch
+            batch_size = min(self.batch_size, num_simulations - sims_completed)
+            
+            # Collect leaves for batch evaluation
+            leaves = []
+            paths = []
+            terminal_leaves = []
+            terminal_paths = []
+            
+            # Select leaves until batch size or all leaves are terminal
+            while len(leaves) + len(terminal_leaves) < batch_size:
+                leaf, path = select_node(root, self.exploration_weight)
+                
+                # Process terminal states immediately
+                if leaf.state.is_terminal():
+                    terminal_leaves.append(leaf)
+                    terminal_paths.append(path)
+                else:
+                    leaves.append(leaf)
+                    paths.append(path)
+            
+            # Process terminal states
+            for leaf, path in zip(terminal_leaves, terminal_paths):
+                value = leaf.state.winner if leaf.state.winner is not None else 0
+                backpropagate(path, value)
+                sims_completed += 1
+            
+            # Process non-terminal leaves with batch inference
+            if leaves:
+                # Get all states for batch inference
+                states = [leaf.state for leaf in leaves]
+                
+                # Use batch_infer to evaluate all at once
+                results = ray.get(self.inference_actor.batch_infer.remote(states))
+                
+                # Process results and backpropagate
+                for i, (leaf, path, result) in enumerate(zip(leaves, paths, results)):
+                    policy, value = result
+                    expand_node(leaf, policy)
+                    backpropagate(path, value)
+                    sims_completed += 1
+        
+        return root
 
 def parallel_mcts(root_state, inference_actor, simulations_per_worker, num_workers, 
                  exploration_weight=1.0, temperature=1.0, return_action_probs=True):
-    """Run multiple MCTS searches in parallel and combine results"""
-    # Launch parallel searches
-    root_futures = [
-        mcts_search.remote(root_state, inference_actor, simulations_per_worker, exploration_weight)
-        for _ in range(num_workers)
-    ]
+    """Run parallel MCTS searches with proper batching"""
+    # Create workers
+    workers = [BatchMCTSWorker.remote(
+        inference_actor, 
+        batch_size=32  # Force larger batches
+    ) for _ in range(num_workers)]
+    
+    # Distribute simulations across workers
+    sims_per_worker = simulations_per_worker // num_workers
+    root_futures = [worker.search.remote(
+        root_state, sims_per_worker, add_noise=True
+    ) for worker in workers]
     
     # Get results
     roots = ray.get(root_futures)
@@ -169,15 +198,10 @@ def parallel_mcts(root_state, inference_actor, simulations_per_worker, num_worke
         # Sample action based on distribution
         action = np.random.choice(actions, p=probs)
     
-    # Create policy vector for training
-    policy = np.zeros(len(root_state.get_legal_actions()))
-    legal_actions = root_state.get_legal_actions()
+    # Create policy vector for training - ALWAYS size 9 for TicTacToe
+    policy = np.zeros(9)  # Fixed size for all board states
     for i, a in enumerate(actions):
-        try:
-            policy[legal_actions.index(a)] = visits[i] / np.sum(visits)
-        except ValueError:
-            # In case there's some mismatch
-            pass
+        policy[a] = visits[i] / np.sum(visits)
     
     if return_action_probs:
         return action, policy
@@ -186,5 +210,6 @@ def parallel_mcts(root_state, inference_actor, simulations_per_worker, num_worke
 
 # Legacy API compatibility function
 def mcts_worker(root_state, inference_actor, num_simulations):
-    """Simulate a legacy MCTS worker function"""
-    return mcts_search(root_state, inference_actor, num_simulations)
+    """Legacy compatibility function"""
+    worker = BatchMCTSWorker.remote(inference_actor, batch_size=32)
+    return ray.get(worker.search.remote(root_state, num_simulations))

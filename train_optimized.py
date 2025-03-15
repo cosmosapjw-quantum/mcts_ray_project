@@ -1,4 +1,8 @@
-# train.py - Optimized Self-Play Manager
+# train_optimized.py
+"""
+Optimized AlphaZero-style training with batch processing
+for high GPU utilization and fast training
+"""
 import os
 import ray
 import torch
@@ -6,31 +10,154 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import time
+import threading
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
-import multiprocessing
-import threading
 
 from model import SmallResNet
-from inference.inference_server import InferenceServer
 from utils.state_utils import TicTacToeState
-from mcts.search import parallel_mcts, BatchMCTSWorker
-from config import NUM_SIMULATIONS, NUM_WORKERS, SIMULATIONS_PER_WORKER, VERBOSE
+from inference.batch_inference_server import BatchInferenceServer
+from mcts.node import Node
 
 # Training parameters
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 1e-5
-BATCH_SIZE = 256
+BATCH_SIZE = 128  # Reduced for earlier training
 REPLAY_BUFFER_SIZE = 100000
 CHECKPOINT_DIR = 'checkpoints'
+NUM_SIMULATIONS = 200  # MCTS simulations per move
+MCTS_BATCH_SIZE = 16   # Batch size for MCTS evaluations
+NUM_WORKERS = 1        # Number of parallel MCTS workers
 TEMPERATURE_SCHEDULE = {
-    0: 1.0,     # First 100 moves use temperature 1.0
+    0: 1.0,     # First moves use temperature 1.0
     10: 0.8,    # After 10 moves, temperature drops to 0.8
     20: 0.5,    # After 20 moves, temperature drops to 0.5
 }
 
+# MCTS helper functions
+def select_node(node, exploration_weight=1.0):
+    """Select a leaf node from the tree"""
+    path = [node]
+    while node.children:
+        # Find best child according to UCB formula
+        best_score = float('-inf')
+        best_child = None
+        for child in node.children:
+            # PUCT formula
+            if child.visits == 0:
+                score = float('inf')  # Prioritize unexplored
+            else:
+                q_value = child.value / child.visits
+                u_value = exploration_weight * child.prior * np.sqrt(node.visits) / (1 + child.visits)
+                score = q_value + u_value
+            if score > best_score:
+                best_score = score
+                best_child = child
+        node = best_child
+        path.append(node)
+    return node, path
+
+def expand_node(node, priors, add_noise=False):
+    """Expand a node with actions and their priors"""
+    actions = node.state.get_legal_actions()
+    if not actions:
+        return  # Terminal node
+    
+    # Add Dirichlet noise for root exploration
+    if add_noise and node.parent is None:
+        noise = np.random.dirichlet([0.3] * len(actions))
+        for i, action in enumerate(actions):
+            noisy_prior = 0.75 * priors[action] + 0.25 * noise[i]
+            child_state = node.state.apply_action(action)
+            child = Node(child_state, node)
+            child.prior = noisy_prior
+            child.action = action
+            node.children.append(child)
+    else:
+        for action in actions:
+            child_state = node.state.apply_action(action)
+            child = Node(child_state, node)
+            child.prior = priors[action]
+            child.action = action
+            node.children.append(child)
+
+def backpropagate(path, value):
+    """Update statistics in the path"""
+    for node in reversed(path):
+        node.visits += 1
+        node.value += value
+        value = -value  # Flip for opponent's perspective
+
+# MCTS search with batching
+def mcts_search(root_state, inference_server, num_simulations, batch_size=MCTS_BATCH_SIZE, verbose=False):
+    """Perform MCTS search with batch evaluation"""
+    # Create root node
+    root = Node(root_state)
+    
+    # Get initial policy and value
+    policy, value = ray.get(inference_server.infer.remote(root_state))
+    
+    # Expand root node
+    expand_node(root, policy, add_noise=True)
+    root.value = value
+    root.visits = 1
+    
+    # Run simulations
+    remaining_sims = num_simulations - 1  # -1 for root expansion
+    
+    while remaining_sims > 0:
+        # Collect leaves for evaluation
+        leaves = []
+        paths = []
+        terminal_leaves = []
+        terminal_paths = []
+        
+        # Determine batch size for this iteration
+        current_batch_size = min(batch_size, remaining_sims)
+        
+        # Select leaves until batch is full
+        while len(leaves) + len(terminal_leaves) < current_batch_size:
+            leaf, path = select_node(root)
+            
+            if leaf.state.is_terminal():
+                terminal_leaves.append(leaf)
+                terminal_paths.append(path)
+            else:
+                leaves.append(leaf)
+                paths.append(path)
+                
+            # If we've collected enough leaves, or if there are no more unexpanded nodes
+            if len(leaves) + len(terminal_leaves) >= current_batch_size:
+                break
+        
+        # Process terminal states immediately
+        for leaf, path in zip(terminal_leaves, terminal_paths):
+            value = leaf.state.winner if leaf.state.winner is not None else 0
+            backpropagate(path, value)
+            remaining_sims -= 1
+        
+        # Process non-terminal leaves with batch inference
+        if leaves:
+            # Get leaf states
+            states = [leaf.state for leaf in leaves]
+            if verbose and len(states) > 1:
+                print(f"  Batch size: {len(states)}")
+            
+            # Batch inference
+            results = ray.get(inference_server.batch_infer.remote(states))
+            
+            # Process results
+            for leaf, path, result in zip(leaves, paths, results):
+                policy, value = result
+                expand_node(leaf, policy)
+                backpropagate(path, value)
+                remaining_sims -= 1
+    
+    return root
+
+# Replay buffer for experience
 class ReplayBuffer:
-    """Prioritized experience replay buffer"""
+    """Thread-safe experience replay buffer"""
     def __init__(self, max_size=REPLAY_BUFFER_SIZE):
         self.buffer = deque(maxlen=max_size)
         self.priorities = deque(maxlen=max_size)
@@ -87,12 +214,13 @@ class ReplayBuffer:
         return len(self.buffer)
 
 class SelfPlayManager:
-    """Manager for self-play, training and evaluation with parallel game generation"""
+    """Manager for self-play, training and evaluation with optimized batch processing"""
     
     def __init__(self):
         # Initialize Ray if needed
-        if not ray.is_initialized():
-            ray.init()
+        if ray.is_initialized():
+            ray.shutdown()
+        ray.init()
             
         # Set device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -112,31 +240,23 @@ class SelfPlayManager:
         # Create checkpoint directory
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         
-        # Initialize inference server actor with smaller cache and batch settings
-        self.inference_actor = InferenceServer.remote(
-            batch_wait=0.002,  # Very short wait time
-            cache_size=5000,   # Smaller cache to force more network usage
-            max_batch_size=64  # Larger batch size to improve GPU utilization
+        # Initialize inference server actor
+        self.inference_actor = BatchInferenceServer.remote(
+            batch_wait=0.002,   # Very short wait time
+            cache_size=5000,    # Smaller cache to force more network usage
+            max_batch_size=64   # Larger batch size to improve GPU utilization
         )
         
-        # Create MCTS batch workers for reuse
-        self.batch_workers = [
-            BatchMCTSWorker.remote(self.inference_actor, batch_size=32)
-            for _ in range(NUM_WORKERS)
-        ]
-        
         # Initialize logging
-        self.writer = SummaryWriter()
+        self.writer = SummaryWriter(log_dir='runs/optimized')
         
         # Game counter and metrics
         self.game_count = 0
-        self.game_start_times = {}
         self.win_rates = {1: 0, -1: 0, 0: 0}  # Player 1, Player -1, Draw
         
     def generate_game(self, game_id):
         """Generate a single self-play game"""
-        # Track game start time
-        self.game_start_times[game_id] = time.time()
+        start_time = time.time()
         
         state = TicTacToeState()
         memory = []
@@ -150,22 +270,11 @@ class SelfPlayManager:
                 if move_count >= move_threshold:
                     temperature = temp
             
-            # Use parallel MCTS with one of our batch workers
-            # We alternate workers for better load distribution
-            worker_idx = game_id % len(self.batch_workers)
-            worker = self.batch_workers[worker_idx]
+            # Perform MCTS with batching
+            verbose = (self.game_count < 3 or self.game_count % 10 == 0)  # Show batch info for first few games and occasionally
+            root = mcts_search(state, self.inference_actor, NUM_SIMULATIONS, verbose=verbose)
             
-            # Run search on the selected worker
-            root_future = worker.search.remote(
-                state, 
-                NUM_SIMULATIONS * SIMULATIONS_PER_WORKER // NUM_WORKERS,
-                add_noise=(move_count < 10)  # Only add noise in the first 10 moves
-            )
-            
-            # Get result
-            root = ray.get(root_future)
-            
-            # Extract visit counts to create policy
+            # Convert visit counts to policy
             visits = np.array([child.visits for child in root.children])
             actions = [child.action for child in root.children]
             
@@ -186,8 +295,8 @@ class SelfPlayManager:
                 # Sample action based on distribution
                 action = np.random.choice(actions, p=probs)
             
-            # Create full policy vector - ALWAYS size 9 for TicTacToe
-            policy = np.zeros(9)  # Fixed size for all policies
+            # Create full policy vector
+            policy = np.zeros(9)  # Fixed size for TicTacToe
             for i, a in enumerate(actions):
                 policy[a] = visits[i] / np.sum(visits)
             
@@ -195,30 +304,21 @@ class SelfPlayManager:
             state_tensor = torch.tensor(state.board, dtype=torch.float).to(self.device)
             policy_tensor = torch.tensor(policy, dtype=torch.float).to(self.device)
             
-            # Debug the shapes
-            if VERBOSE and self.game_count == 0 and move_count == 0:
-                print(f"State tensor shape: {state_tensor.shape}, Policy tensor shape: {policy_tensor.shape}")
-                
             # Store experience
             memory.append((state_tensor, policy_tensor, state.current_player))
             
             # Apply action
             state = state.apply_action(action)
             move_count += 1
-            
-            if VERBOSE and move_count % 5 == 0:
-                print(f"Game {game_id}, Move {move_count}")
         
         # Game finished
         outcome = state.winner
-        game_time = time.time() - self.game_start_times[game_id]
+        game_time = time.time() - start_time
         
-        if VERBOSE:
-            print(f"Game {game_id} finished after {move_count} moves with outcome: {outcome}, time: {game_time:.1f}s")
+        print(f"Game {game_id}: {move_count} moves, outcome={outcome}, time={game_time:.1f}s, buffer={len(self.replay_buffer)}")
         
         # Update win rate statistics
-        with threading.Lock():
-            self.win_rates[outcome] = self.win_rates.get(outcome, 0) + 1
+        self.win_rates[outcome] = self.win_rates.get(outcome, 0) + 1
         
         # Add experiences to replay buffer
         for state_tensor, policy_tensor, player in memory:
@@ -235,25 +335,11 @@ class SelfPlayManager:
             self.replay_buffer.add((state_tensor, policy_tensor, target_value), priority)
             
         return outcome, move_count
-    
-    def generate_games_parallel(self, num_games):
-        """Generate multiple games in parallel"""
-        game_ids = list(range(self.game_count, self.game_count + num_games))
-        
-        # Launch games in parallel
-        game_futures = [self.generate_game(game_id) for game_id in game_ids]
-        
-        # Get results
-        results = []
-        for future in game_futures:
-            results.append(future)
-            
-        self.game_count += num_games
-        return results
         
     def train_batch(self):
         """Train on a batch of experiences"""
-        if len(self.replay_buffer) < BATCH_SIZE:
+        MIN_BUFFER_SIZE = max(BATCH_SIZE // 2, 32)  # Start training with fewer samples  # Wait for a good amount of samples
+        if len(self.replay_buffer) < MIN_BUFFER_SIZE:
             return None
             
         # Sample batch
@@ -262,6 +348,7 @@ class SelfPlayManager:
             return None
             
         states, policies, values = batch
+        values = values.to(self.device)
         
         # Zero gradients
         self.optimizer.zero_grad()
@@ -304,8 +391,7 @@ class SelfPlayManager:
             'game_count': self.game_count
         }, path)
         
-        if VERBOSE:
-            print(f"Saved checkpoint: {path}")
+        print(f"Saved checkpoint: {path}")
             
     def load_checkpoint(self, name="model"):
         """Load model checkpoint"""
@@ -319,38 +405,31 @@ class SelfPlayManager:
             # Update inference server
             self.update_inference_server()
             
-            if VERBOSE:
-                print(f"Loaded checkpoint: {path}")
+            print(f"Loaded checkpoint: {path}")
                 
-    def train(self, num_games=1000):
+    def train(self, num_games=100):
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5)
         """Main training loop"""
         # Start tracking time
         start_time = time.time()
         train_start_time = time.time()
         
-        # Determine how many games to run in parallel
-        # We want to balance parallelism without overloading the system
-        num_cores = multiprocessing.cpu_count()
-        parallel_games = min(8, max(1, num_cores // 3))
-        
-        if VERBOSE:
-            print(f"Running {parallel_games} games in parallel")
-        
         # Main training loop
         games_completed = 0
         while games_completed < num_games:
-            # Generate a batch of games in parallel
-            batch_size = min(parallel_games, num_games - games_completed)
-            
-            # Generate games
-            for _ in range(batch_size):
-                self.generate_game(self.game_count)
-                self.game_count += 1
-                games_completed += 1
+            # Generate a game
+            self.generate_game(self.game_count)
+            self.game_count += 1
+            games_completed += 1
             
             # Train on replay buffer
             loss = self.train_batch()
             if loss is not None:
+                # Update learning rate scheduler
+                scheduler.step(loss)
+                # Update learning rate scheduler
+                scheduler.step(loss)
                 self.writer.add_scalar('Training/Loss', loss, self.game_count)
             
             # Update inference server periodically
@@ -358,11 +437,12 @@ class SelfPlayManager:
                 self.update_inference_server()
                 
             # Save checkpoint periodically
-            if self.game_count % 50 == 0:
+            if self.game_count % 20 == 0:
                 self.save_checkpoint(f"model_{self.game_count}")
                 
             # Print stats periodically
-            if self.game_count % 10 == 0 or games_completed == num_games:
+            # Get batch stats from inference server if available
+            if self.game_count % 5 == 0 or games_completed == num_games:
                 elapsed = time.time() - start_time
                 total_elapsed = time.time() - train_start_time
                 games_per_hour = games_completed / (total_elapsed / 3600)
@@ -377,26 +457,34 @@ class SelfPlayManager:
                 else:
                     win_rate_p1, win_rate_p2, draw_rate = 0, 0, 0
                 
-                print(f"Game {self.game_count}: " +
-                      f"buffer={buffer_size}, " +
-                      f"loss={loss:.4f if loss else 'N/A'}, " +
-                      f"rate={games_per_hour:.1f} games/hr, " +
-                      f"P1 wins: {win_rate_p1:.1f}%, " +
-                      f"P2 wins: {win_rate_p2:.1f}%, " +
-                      f"Draws: {draw_rate:.1f}%")
+                print(f"\nTraining Summary (Game {self.game_count}):")
+                print(f"  Buffer size: {buffer_size}")
+                if loss is not None:
+                    loss_str = f"{loss:.4f}"
+                else:
+                    loss_str = "N/A"
+                print(f"  Loss: {loss_str}, LR: {scheduler.get_last_lr()[0]:.2e}")
+                print(f"  Rate: {games_per_hour:.1f} games/hr")
+                print(f"  Win rates: P1={win_rate_p1:.1f}%, P2={win_rate_p2:.1f}%, Draw={draw_rate:.1f}%")
                 
-                # Reset tracking
+                # Reset tracking time
                 start_time = time.time()
                 
         # Save final model
         self.save_checkpoint("model_final")
         self.writer.close()
+        
+        # Print final stats
+        print("\nTraining completed!")
+        print(f"Total games: {num_games}")
+        print(f"Time: {(time.time() - train_start_time) / 60:.1f} minutes")
+        print(f"Games per hour: {games_completed / ((time.time() - train_start_time) / 3600):.1f}")
 
 if __name__ == "__main__":
     # Create manager and run training
     manager = SelfPlayManager()
     try:
-        manager.train(num_games=1000)
+        manager.train(num_games=100)
     finally:
         # Ensure clean shutdown
         ray.shutdown()
