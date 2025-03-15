@@ -1,11 +1,11 @@
 import ray
 from utils.state_utils import TicTacToeState
 from mcts.search import mcts_worker
-from inference.inference_server import InferenceServer
+from inference.batch_inference_server import BatchInferenceServer
 from config import NUM_SIMULATIONS, NUM_WORKERS
 
 ray.init()
-inference_actor = InferenceServer.remote()
+inference_actor = BatchInferenceServer.remote()
 
 def evaluate_model(num_games=50):
     wins, losses, draws = 0, 0, 0
