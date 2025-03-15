@@ -1,6 +1,6 @@
 # utils/state_utils.py (Fixed TicTacToe State)
 import numpy as np
-from game_interface import GameState
+from utils.game_interface import GameState
 
 # Pre-computed win patterns for TicTacToe
 WIN_PATTERNS = [
