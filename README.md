@@ -1,152 +1,182 @@
-# AlphaZero-style Learning Framework
+# MCTS AlphaZero Implementation
 
-A modular, efficient implementation of AlphaZero-style reinforcement learning for board games, featuring optimized MCTS and distributed training capabilities.
+A fast and efficient Monte Carlo Tree Search (MCTS) implementation in Python with root parallelization and centralized batch inference. This project provides a semi-production level codebase using pure Python and Ray for easy debugging with minimal boilerplate.
 
 ## Features
 
-- **Multiple MCTS Implementations**: Choose from basic reference, high-performance, or distributed algorithms
-- **Distributed Training**: Parallel self-play and inference with Ray
-- **Task-based Parallelism**: Efficient and stable parallel MCTS implementation
-- **GPU Acceleration**: Batched neural network inference with PyTorch
-- **Modular Design**: Clean separation of concerns for easy extension to new games
+- **Flexible architecture** for various board games and neural network models
+- **Optimized MCTS implementations**:
+  - Single-threaded with Numba acceleration
+  - Root parallelization with Ray
+  - Time-based search option
+- **Batched inference server** for efficient GPU utilization
+- **Comprehensive self-play training** pipeline with replay buffer
+- **Automatic hyperparameter optimization** with Ray Tune
+- **Visualization and analysis tools** for model performance and hyperparameters
 
 ## Project Structure
 
+- `mcts/`: Core MCTS implementations and algorithms
+  - `core.py`: Foundational MCTS algorithms
+  - `tree.py`: Optimized Numba-accelerated implementations
+  - `search.py`: Distributed and parallel search with Ray
+  - `node.py`: Enhanced tree node implementation
+- `inference/`: Neural network inference components
+  - `batch_inference_server.py`: Ray-based batch inference server
+- `train/`: Training and optimization modules
+  - `self_play.py`: Self-play manager
+  - `replay_buffer.py`: Experience replay buffer
+  - `trainer.py`: Neural network trainer
+- `utils/`: Utility functions and interfaces
+  - `game_interface.py`: Abstract interface for game states
+  - `state_utils.py`: TicTacToe state implementation
+  - `mcts_utils.py`: Utility functions for MCTS
+- `hyperparameter_tuning.py`: Automated hyperparameter optimization
+- `hyperparameter_analysis.py`: Analysis and visualization of tuning results
+- `config.py`: Configuration and hyperparameters
+- `main.py`: CLI for training, evaluation, and hyperparameter tuning
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/mcts-alphazero.git
+cd mcts-alphazero
+
+# Install dependencies
+pip install -r requirements.txt
 ```
-alphazero/               # Root package folder
-├── __init__.py          # Package initialization
-├── main.py              # Main entry point
-├── config.py            # Configuration and hyperparameters
-├── model.py             # Neural network architecture
-├── mcts/                # Monte Carlo Tree Search implementations
-│   ├── __init__.py
-│   ├── core.py          # Basic MCTS algorithms
-│   ├── tree.py          # Optimized implementations with Numba
-│   ├── search.py        # Distributed search with Ray
-│   └── node.py          # Tree node definition
-├── train/               # Training-related modules
-│   ├── __init__.py
-│   ├── self_play.py     # Self-play game generation
-│   ├── trainer.py       # Neural network training logic
-│   └── replay_buffer.py # Experience replay buffer
-├── utils/               # Utility functions
-│   ├── __init__.py
-│   ├── game_interface.py # Game interface abstractions
-│   ├── state_utils.py    # Game state implementations
-│   └── mcts_utils.py     # MCTS utilities
-└── inference/           # Neural network inference
-    └── batch_inference_server.py  # Batched inference server
-```
-
-## MCTS Implementations
-
-The framework provides three MCTS implementations with increasing performance characteristics:
-
-1. **Basic MCTS** (`mcts/core.py`): Simple, reference implementation for learning and experimentation
-2. **Optimized MCTS** (`mcts/tree.py`): Performance-optimized with Numba for single-machine execution
-3. **Distributed MCTS** (`mcts/search.py`): Parallel and batched search for distributed computing
-
-### Parallel MCTS Approaches
-
-The framework supports multiple parallelization strategies:
-
-1. **Task-based Parallel MCTS**: Uses Ray tasks for distributed computation with minimal serialization overhead
-2. **Batched MCTS**: Collects leaves in batches for efficient neural network inference
-3. **Time-based MCTS**: Uses time budgets instead of simulation counts for more consistent performance
 
 ## Usage
 
-### Training a Model
+### Training
+
+Train a model with default parameters:
 
 ```bash
-# Basic training with batched search (default)
 python main.py train --games 200
-
-# Training with task-based parallel MCTS (recommended)
-python main.py train --enable-parallel-mcts --max-workers 2 --games 200
-
-# Training with more parallelism (if your system can handle it)
-python main.py train --enable-parallel-mcts --max-workers 4 --games 200
-
-# Training with time-based search (very stable)
-python main.py train --time-based-search --search-time 0.5 --games 200
-
-# Continue training from a checkpoint
-python main.py train --checkpoint model_100 --games 200 --enable-parallel-mcts
 ```
 
-### Evaluating a Model
+Train with specific settings:
 
 ```bash
-# Evaluate a trained model
-python main.py eval --checkpoint model_final --games 20 --simulations 1600
-
-# Detailed evaluation with verbose output
-python main.py eval --checkpoint model_final --games 5 --verbose
+python main.py train --games 500 --enable-parallel-mcts --max-workers 4
 ```
 
-## Performance Tuning
+Use time-based search instead of fixed simulations:
 
-The performance of the MCTS implementations can be tuned based on your hardware:
+```bash
+python main.py train --time-based-search --search-time 1.5
+```
 
-### For CPU-Only Systems
-- Use batched MCTS with a small batch size (~8-16)
-- Disable parallel MCTS to avoid overhead
-- Use Numba-optimized tree search from `mcts/tree.py`
+### Evaluation
 
-### For GPU Systems
-- Enable task-based parallel MCTS with 2-4 workers
-- Use larger batch sizes (32-64) for efficient GPU utilization
-- Increase simulation count for stronger play
+Evaluate a trained model:
 
-### For Multi-GPU Systems
-- Distribute inference across GPUs using Ray
-- Use more workers (up to 8) for parallel MCTS
-- Consider time-based search for better load balancing
+```bash
+python main.py eval --checkpoint model_latest --games 20
+```
 
-### Memory Considerations
-- The replay buffer size can be adjusted in `config.py`
-- For systems with limited RAM, reduce `RAY_OBJECT_STORE_MEMORY`
-- Monitor GPU memory usage and adjust batch sizes accordingly
+### Hyperparameter Optimization
 
-## Extending to New Games
+The project includes a comprehensive hyperparameter optimization system built on Ray Tune. This allows you to systematically search for optimal hyperparameters across your entire training pipeline.
 
-To add support for a new game:
+#### Running Hyperparameter Tuning
 
-1. Implement the `GameState` interface from `utils/game_interface.py`
-2. Add game-specific state encoding in your implementation
-3. Update the neural network architecture in `model.py` if needed
+Basic tuning with default settings:
 
-Example of implementing a new game:
+```bash
+python main.py tune --games 50 --trials 10
+```
+
+Advanced tuning with resource configuration:
+
+```bash
+python main.py tune --games 50 --trials 20 --cpus 8 --gpus 1 --concurrent-trials 4 --search-algo bayesopt --scheduler asha
+```
+
+Available options:
+- `--games`: Number of games for each trial
+- `--trials`: Total number of configurations to try
+- `--concurrent-trials`: Number of trials to run in parallel
+- `--cpus`, `--gpus`: Total resources to allocate
+- `--cpus-per-trial`, `--gpus-per-trial`: Resources per trial
+- `--search-algo`: Search algorithm (random, bayesopt, hyperopt)
+- `--scheduler`: Scheduler for early stopping (asha, pbt, none)
+- `--output-dir`: Directory for results
+- `--resume`: Resume previous tuning session
+
+#### Analyzing Tuning Results
+
+After running hyperparameter optimization, you can analyze the results:
+
+```bash
+python main.py analyze ./ray_results/latest_experiment --all
+```
+
+Generate specific visualizations:
+
+```bash
+python main.py analyze ./ray_results/latest_experiment --learning-curves --parameter-importance --output-dir ./analysis
+```
+
+Apply the best configuration to a file:
+
+```bash
+python main.py analyze ./ray_results/latest_experiment --apply-best
+```
+
+Analysis options:
+- `--learning-curves`: Plot learning curves for top configurations
+- `--parameter-importance`: Visualize parameter impact on performance
+- `--pairwise`: Plot pairwise relationships between parameters
+- `--parallel-coords`: Create parallel coordinates plots
+- `--print-best`: Print details of best configurations
+- `--apply-best`: Generate a new config file with best parameters
+- `--all`: Run all analyses
+- `--metric`: Metric to optimize (default: loss)
+- `--mode`: Optimization mode (min or max)
+- `--top-n`: Number of top configurations to consider
+
+#### Hyperparameters Being Optimized
+
+The optimization system tunes parameters across the entire pipeline:
+
+- **Learning parameters**: Learning rates, weight decay, batch sizes
+- **MCTS parameters**: Simulation counts, batch sizes, exploration weights
+- **Temperature parameters**: Initial and final temperatures, decay schedule
+- **Inference server parameters**: Batch wait times, cache sizes, max batch sizes
+- **Search strategy parameters**: Parallel vs. batched search, time-based vs. simulation-based
+
+## Extending the Project
+
+### Adding New Games
+
+1. Implement the `GameState` interface in `utils/game_interface.py`
+2. Create a new state implementation similar to `TicTacToeState`
+3. Update model architecture if necessary
+
+### Customizing Hyperparameter Search
+
+Modify `hyperparameter_tuning.py` to customize the search space:
 
 ```python
-class MyGameState(GameState):
-    def __init__(self):
-        # Initialize game state
-        
-    def is_terminal(self):
-        # Check if game has ended
-        
-    def get_legal_actions(self):
-        # Return list of legal actions
-        
-    def apply_action(self, action):
-        # Return new state after applying action
-        
-    def get_current_player(self):
-        # Return current player
-        
-    def encode(self):
-        # Encode state for neural network
-        
-    def get_winner(self):
-        # Return winner if game ended
+def get_search_space():
+    return {
+        # Add or modify parameters as needed
+        "LEARNING_RATE": tune.loguniform(1e-5, 1e-2),
+        "MY_NEW_PARAMETER": tune.choice([1, 2, 3]),
+        # ...
+    }
 ```
 
-## Requirements
+## Performance Considerations
 
-- Python 3.8+
-- PyTorch 1.9+
-- Ray 2.0+
-- NumPy
-- Numba (for optimized tree search)
+- For maximum performance, use parallel MCTS with batch inference
+- GPU acceleration provides significant speedups for model inference
+- Adjust batch sizes based on your hardware capabilities
+- Consider time-based search for more consistent move timing
+
+## License
+
+[MIT License](LICENSE)

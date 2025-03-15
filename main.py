@@ -1,11 +1,12 @@
 # main.py
 """
 Main entry point for AlphaZero-style training.
-Provides a command-line interface for training and evaluation.
+Provides a command-line interface for training, evaluation, and hyperparameter tuning.
 """
 import ray
 import argparse
 import os
+import sys
 from train.self_play import SelfPlayManager
 from utils.state_utils import TicTacToeState
 from inference.batch_inference_server import BatchInferenceServer
@@ -151,9 +152,110 @@ def evaluate(args):
     # Clean up
     ray.shutdown()
 
+def tune_hyperparameters(args):
+    """Run hyperparameter optimization"""
+    try:
+        # Import hyperparameter tuning module dynamically
+        from hyperparameter_tuning import run_hyperparameter_optimization
+    except ImportError:
+        print("Error: hyperparameter_tuning.py module not found.")
+        print("Please ensure it exists in the current directory.")
+        return
+    
+    # Convert args to the format expected by hyperparameter_tuning
+    tune_args = argparse.Namespace(
+        games=args.games,
+        num_trials=args.trials,
+        output_dir=args.output_dir,
+        cpus=args.cpus,
+        gpus=args.gpus,
+        memory=args.memory,
+        object_store_memory=args.object_store_memory,
+        cpus_per_trial=args.cpus_per_trial,
+        gpus_per_trial=args.gpus_per_trial,
+        grace_period=args.grace_period,
+        brackets=args.brackets,
+        search_algo=args.search_algo,
+        scheduler=args.scheduler,
+        concurrent_trials=args.concurrent_trials,
+        verbose=args.verbose,
+        fail_fast=args.fail_fast,
+        resume=args.resume
+    )
+    
+    # Run hyperparameter optimization
+    best_config, analysis = run_hyperparameter_optimization(tune_args)
+    
+    # Print additional information if verbose
+    if args.verbose:
+        print("\nAnalysis Summary:")
+        print(f"Total trials: {len(analysis.trials)}")
+        print(f"Completed trials: {sum(1 for t in analysis.trials.values() if t.status == 'TERMINATED')}")
+        print(f"Failed trials: {sum(1 for t in analysis.trials.values() if t.status == 'ERROR')}")
+    
+    return best_config, analysis
+
+def analyze_results(args):
+    """Analyze hyperparameter tuning results"""
+    try:
+        # Import hyperparameter analysis module dynamically
+        from hyperparameter_analysis import (
+            load_results, plot_learning_curves, plot_parameter_importance,
+            plot_pairwise_relationships, plot_parallel_coordinates,
+            print_best_configurations, apply_config_to_file
+        )
+    except ImportError:
+        print("Error: hyperparameter_analysis.py module not found.")
+        print("Please ensure it exists in the current directory.")
+        return
+    
+    # Create output directory if specified
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Load results
+    print(f"Loading results from {args.experiment_dir}...")
+    analysis = load_results(args.experiment_dir)
+    
+    # Determine which analyses to run
+    run_all = args.all
+    
+    # Perform requested analyses
+    if args.learning_curves or run_all:
+        print("Plotting learning curves...")
+        save_path = os.path.join(args.output_dir, 'learning_curves.png') if args.output_dir else None
+        plot_learning_curves(analysis, args.metric, args.mode, args.top_n, save_path)
+    
+    if args.parameter_importance or run_all:
+        print("Plotting parameter importance...")
+        save_path = os.path.join(args.output_dir, 'parameter_importance.png') if args.output_dir else None
+        plot_parameter_importance(analysis, args.metric, args.mode, save_path)
+    
+    if args.pairwise or run_all:
+        print("Plotting pairwise relationships...")
+        save_path = os.path.join(args.output_dir, 'pairwise_relationships.png') if args.output_dir else None
+        plot_pairwise_relationships(analysis, args.metric, None, args.top_n * 10, save_path)
+        
+    if args.parallel_coords or run_all:
+        print("Plotting parallel coordinates...")
+        save_path = os.path.join(args.output_dir, 'parallel_coordinates.png') if args.output_dir else None
+        plot_parallel_coordinates(analysis, args.metric, args.mode, args.top_n, save_path)
+    
+    if args.print_best or run_all or not any([args.learning_curves, args.parameter_importance, 
+                                             args.pairwise, args.parallel_coords, args.apply_best]):
+        print_best_configurations(analysis, args.metric, args.mode, args.top_n)
+    
+    if args.apply_best or run_all:
+        # Get best configuration
+        best_config = analysis.get_best_config(args.metric, mode=args.mode)
+        output_file = "tuned_config.py"
+        if args.output_dir:
+            output_file = os.path.join(args.output_dir, output_file)
+        apply_config_to_file(best_config, output_file)
+
 def main():
     """Main entry point with command-line argument parsing"""
-    parser = argparse.ArgumentParser(description='AlphaZero-style training and evaluation')
+    parser = argparse.ArgumentParser(description='AlphaZero-style training, evaluation, and hyperparameter tuning')
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
     
     # Train command
@@ -177,12 +279,64 @@ def main():
     eval_parser.add_argument('--simulations', type=int, default=800, help='Simulations per move')
     eval_parser.add_argument('--verbose', action='store_true', help='Print detailed information')
     
+    # Hyperparameter tuning command
+    tune_parser = subparsers.add_parser('tune', help='Optimize hyperparameters')
+    
+    # Trial parameters
+    tune_parser.add_argument('--games', type=int, default=50, help='Number of games for each trial')
+    tune_parser.add_argument('--trials', type=int, default=10, help='Number of trials to run')
+    tune_parser.add_argument('--concurrent-trials', type=int, default=2, help='Number of concurrent trials')
+    tune_parser.add_argument('--grace-period', type=int, default=10, help='Minimum games before early stopping')
+    tune_parser.add_argument('--brackets', type=int, default=3, help='Number of brackets for ASHA scheduler')
+    
+    # Ray resources
+    tune_parser.add_argument('--cpus', type=int, default=None, help='Total number of CPUs to use')
+    tune_parser.add_argument('--gpus', type=int, default=None, help='Total number of GPUs to use')
+    tune_parser.add_argument('--cpus-per-trial', type=int, default=1, help='CPUs to allocate per trial')
+    tune_parser.add_argument('--gpus-per-trial', type=float, default=0.5, help='GPUs to allocate per trial')
+    tune_parser.add_argument('--memory', type=float, default=None, help='Memory limit in GB')
+    tune_parser.add_argument('--object-store-memory', type=float, default=None, help='Object store memory in GB')
+    
+    # Search configuration
+    tune_parser.add_argument('--scheduler', type=str, default='asha', 
+                            choices=['asha', 'pbt', 'none'], help='Scheduler to use')
+    tune_parser.add_argument('--search-algo', type=str, default='bayesopt', 
+                            choices=['random', 'bayesopt', 'hyperopt'], help='Search algorithm')
+    
+    # Output options
+    tune_parser.add_argument('--output-dir', type=str, default='./ray_results', help='Directory for results')
+    tune_parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
+    tune_parser.add_argument('--fail-fast', action='store_true', help='Stop if a trial fails')
+    tune_parser.add_argument('--resume', action='store_true', help='Resume previous tuning session')
+    
+    # Analysis command
+    analyze_parser = subparsers.add_parser('analyze', help='Analyze hyperparameter tuning results')
+    analyze_parser.add_argument('experiment_dir', type=str, help='Path to experiment directory')
+    analyze_parser.add_argument('--metric', type=str, default='loss', help='Metric to analyze')
+    analyze_parser.add_argument('--mode', type=str, default='min', choices=['min', 'max'], 
+                               help='Whether to minimize or maximize the metric')
+    analyze_parser.add_argument('--output-dir', type=str, default=None, help='Directory for analysis output')
+    analyze_parser.add_argument('--top-n', type=int, default=5, help='Number of top configurations to analyze')
+    
+    # Analysis options
+    analyze_parser.add_argument('--all', action='store_true', help='Run all analyses')
+    analyze_parser.add_argument('--learning-curves', action='store_true', help='Plot learning curves')
+    analyze_parser.add_argument('--parameter-importance', action='store_true', help='Plot parameter importance')
+    analyze_parser.add_argument('--pairwise', action='store_true', help='Plot pairwise relationships')
+    analyze_parser.add_argument('--parallel-coords', action='store_true', help='Plot parallel coordinates')
+    analyze_parser.add_argument('--print-best', action='store_true', help='Print best configurations')
+    analyze_parser.add_argument('--apply-best', action='store_true', help='Apply best config to a file')
+    
     args = parser.parse_args()
     
     if args.command == 'train':
         train(args)
     elif args.command == 'eval':
         evaluate(args)
+    elif args.command == 'tune':
+        tune_hyperparameters(args)
+    elif args.command == 'analyze':
+        analyze_results(args)
     else:
         parser.print_help()
 
