@@ -1,3 +1,5 @@
+# utils/game_interface.py
+
 from abc import ABC, abstractmethod
 
 class GameState(ABC):
