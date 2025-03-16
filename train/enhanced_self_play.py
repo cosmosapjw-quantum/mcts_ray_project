@@ -157,11 +157,11 @@ class EnhancedSelfPlayManager:
     
     def inference_function(self, state_or_batch):
         """
-        Wrapper function for neural network inference with proper Ray handling.
+        Wrapper function for neural network inference with improved batch handling.
         
         Args:
             state_or_batch: Single state or batch of states
-                
+                    
         Returns:
             For single state: (policy, value) tuple
             For batch: List of (policy, value) tuples
@@ -196,24 +196,35 @@ class EnhancedSelfPlayManager:
             
             # Check if it's a batch or single state
             if isinstance(state_or_batch, list):
-                # Batch inference with timeout and error handling
-                try:
-                    batch_result = ray.get(self.inference_server.batch_infer.remote(state_or_batch), timeout=10.0)
-                    setattr(self, '_inference_attempt_count', 0)  # Reset counter on success
-                    return batch_result
-                except (ray.exceptions.GetTimeoutError, ray.exceptions.RayActorError) as e:
-                    logger.warning(f"Batch inference timeout or actor failure: {e}. Using fallback.")
-                    
-                    # Try to recreate server and retry ONE more time
-                    if self._recreate_inference_server():
+                # CRITICAL FIX: For larger batches, split into smaller chunks to avoid timeout
+                batch_size = len(state_or_batch)
+                max_chunk_size = 32  # Maximum safe chunk size
+                
+                if batch_size <= max_chunk_size:
+                    # Process small batches directly
+                    try:
+                        batch_result = ray.get(self.inference_server.batch_infer.remote(state_or_batch), timeout=10.0)
+                        setattr(self, '_inference_attempt_count', 0)  # Reset counter on success
+                        return batch_result
+                    except (ray.exceptions.GetTimeoutError, ray.exceptions.RayActorError) as e:
+                        logger.warning(f"Batch inference timeout or actor failure: {e}. Using fallback.")
+                        return [(np.ones(9)/9, 0.0) for _ in state_or_batch]
+                else:
+                    # Split large batches into chunks for more reliable processing
+                    logger.info(f"Splitting large batch of {batch_size} into chunks of {max_chunk_size}")
+                    results = []
+                    for i in range(0, batch_size, max_chunk_size):
+                        chunk = state_or_batch[i:i+max_chunk_size]
                         try:
-                            logger.info("Retrying batch inference after server recreation")
-                            return self.inference_function(state_or_batch)  # Recursive retry
-                        except Exception:
-                            pass
-                            
-                    # Return uniform policies and neutral values as fallback
-                    return [(np.ones(9)/9, 0.0) for _ in state_or_batch]
+                            chunk_results = ray.get(self.inference_server.batch_infer.remote(chunk), timeout=10.0)
+                            results.extend(chunk_results)
+                        except Exception as e:
+                            logger.warning(f"Chunk inference failed: {e}")
+                            # Fill with defaults for failed chunk
+                            results.extend([(np.ones(9)/9, 0.0) for _ in range(len(chunk))])
+                    
+                    setattr(self, '_inference_attempt_count', 0)  # Reset counter on success
+                    return results
             else:
                 # Single state inference with timeout and error handling
                 try:
@@ -222,17 +233,8 @@ class EnhancedSelfPlayManager:
                     return single_result
                 except (ray.exceptions.GetTimeoutError, ray.exceptions.RayActorError) as e:
                     logger.warning(f"Single inference timeout or actor failure: {e}. Using fallback.")
-                    
-                    # Try to recreate server and retry ONE more time
-                    if self._recreate_inference_server():
-                        try:
-                            logger.info("Retrying single inference after server recreation")
-                            return self.inference_function(state_or_batch)  # Recursive retry
-                        except Exception:
-                            pass
-                    
-                    # Return uniform policy and neutral value as fallback
                     return (np.ones(9)/9, 0.0)
+                    
         except Exception as e:
             logger.error(f"Unexpected error in inference function: {e}")
             setattr(self, '_inference_attempt_count', 0)  # Reset counter
@@ -260,13 +262,17 @@ class EnhancedSelfPlayManager:
             
             root, stats = leaf_parallel_search(
                 root_state=state,
-                inference_fn=self.inference_function,  # Use the fixed inference function
+                inference_fn=self.inference_function,
                 num_simulations=self.num_simulations,
                 num_collectors=self.num_collectors,
                 batch_size=self.batch_size,
                 exploration_weight=self.exploration_weight,
                 add_dirichlet_noise=True,
-                collect_stats=self.verbose
+                collect_stats=self.verbose,
+                # Add these new parameters
+                min_batch_size=max(1, self.batch_size // 4),  # 25% of batch size
+                evaluator_wait_time=0.020,  # 20ms
+                verbose=self.verbose
             )
             
             search_time = time.time() - search_start
