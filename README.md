@@ -1,40 +1,66 @@
 # MCTS AlphaZero Implementation
 
-A fast and efficient Monte Carlo Tree Search (MCTS) implementation in Python with root parallelization and centralized batch inference. This project provides a semi-production level codebase using pure Python and Ray for easy debugging with minimal boilerplate.
+A high-performance Monte Carlo Tree Search (MCTS) implementation in Python with leaf parallelization and centralized batch inference. This project provides a sophisticated framework for AlphaZero-style reinforcement learning, optimized for both CPU and GPU utilization while maintaining adaptability for various board games.
 
-## Features
+## Key Features
 
-- **Flexible architecture** for various board games and neural network models
-- **Optimized MCTS implementations**:
-  - Single-threaded with Numba acceleration
-  - Root parallelization with Ray
-  - Time-based search option
-- **Batched inference server** for efficient GPU utilization
-- **Comprehensive self-play training** pipeline with replay buffer
-- **Automatic hyperparameter optimization** with Ray Tune
-- **Visualization and analysis tools** for model performance and hyperparameters
+- **Multiple optimized MCTS implementations**:
+  - Standard single-threaded MCTS with configurable exploration parameters
+  - Numba-accelerated tree operations for improved CPU performance
+  - Leaf-parallel MCTS with multi-threaded collectors for efficient tree exploration
+  - Ray-based distributed search with fault tolerance
+
+- **Advanced batch inference architecture**:
+  - Centralized inference server with adaptive batching
+  - Optimized GPU utilization with configurable batch sizing
+  - Efficient caching system to reduce redundant evaluations
+  - Mixed precision support for faster inference
+
+- **Comprehensive training pipeline**:
+  - Asynchronous self-play with separate processes for generation and training
+  - Experience replay buffer with prioritized sampling
+  - Enhanced optimization with mixed precision training
+  - Checkpointing and model versioning
+
+- **Robust system design**:
+  - Improved Ray manager with health monitoring and automatic recovery
+  - Performance profiling and bottleneck detection
+  - Memory optimization for large-scale training
+  - Systematic error handling and graceful degradation
 
 ## Project Structure
 
-- `mcts/`: Core MCTS implementations and algorithms
-  - `core.py`: Foundational MCTS algorithms
-  - `tree.py`: Optimized Numba-accelerated implementations
-  - `search.py`: Distributed and parallel search with Ray
-  - `node.py`: Enhanced tree node implementation
-- `inference/`: Neural network inference components
-  - `batch_inference_server.py`: Ray-based batch inference server
-- `train/`: Training and optimization modules
-  - `self_play.py`: Self-play manager
-  - `replay_buffer.py`: Experience replay buffer
-  - `trainer.py`: Neural network trainer
-- `utils/`: Utility functions and interfaces
-  - `game_interface.py`: Abstract interface for game states
-  - `state_utils.py`: TicTacToe state implementation
-  - `mcts_utils.py`: Utility functions for MCTS
-- `hyperparameter_tuning.py`: Automated hyperparameter optimization
-- `hyperparameter_analysis.py`: Analysis and visualization of tuning results
-- `config.py`: Configuration and hyperparameters
-- `main.py`: CLI for training, evaluation, and hyperparameter tuning
+```
+├── mcts/                       # Core MCTS implementations
+│   ├── core.py                 # Foundational MCTS algorithms
+│   ├── tree.py                 # Numba-optimized implementations
+│   ├── search.py               # Distributed and parallel search with Ray
+│   ├── node.py                 # Enhanced tree node implementation 
+│   ├── enhanced_batch_search.py# Optimized batched MCTS
+│   └── leaf_parallel_mcts.py   # Multi-threaded leaf parallelization
+├── inference/                  # Neural network inference components
+│   ├── state_batcher.py        # Efficient state batching for GPU
+│   └── enhanced_batch_inference_server.py # Advanced batching server
+├── train/                      # Training and optimization modules
+│   ├── async_training.py       # Asynchronous training pipeline
+│   ├── efficient_data.py       # Optimized data handling
+│   ├── enhanced_self_play.py   # Improved self-play manager
+│   ├── optimized_trainer.py    # Training with enhanced features
+│   ├── patch_self_play.py      # Mock components for testing
+│   ├── replay_buffer.py        # Experience replay buffer
+│   └── trainer.py              # Neural network trainer
+├── utils/                      # Utility functions and interfaces
+│   ├── game_interface.py       # Abstract interface for game states
+│   ├── improved_ray_manager.py # Enhanced Ray configuration
+│   ├── mcts_utils.py           # Utility functions for MCTS
+│   ├── memory_optimization.py  # Memory usage optimization
+│   ├── optimized_state.py      # Efficient state representation
+│   ├── profiling.py            # Performance measurement tools
+│   └── state_utils.py          # Game state implementations
+├── config.py                   # Configuration and hyperparameters
+├── model.py                    # Neural network architecture
+└── main_optimized.py           # Enhanced entry point with optimized settings
+```
 
 ## Installation
 
@@ -45,137 +71,209 @@ cd mcts-alphazero
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Optional: Install CUDA for GPU acceleration
+# See https://pytorch.org/get-started/locally/ for PyTorch with CUDA
 ```
+
+Required dependencies:
+- Python 3.8+
+- PyTorch 1.9+
+- Ray 2.0+
+- NumPy
+- Numba (for optimized tree operations)
 
 ## Usage
 
-### Training
+### Optimized Training
 
-Train a model with default parameters:
-
-```bash
-python main.py train --games 200
-```
-
-Train with specific settings:
+Train a model with enhanced settings for modern hardware:
 
 ```bash
-python main.py train --games 500 --enable-parallel-mcts --max-workers 4
+python main_optimized.py train --games 200 --batch-size 64 --collectors 8
 ```
 
-Use time-based search instead of fixed simulations:
+Available options:
+- `--games`: Number of games to play
+- `--checkpoint`: Path to load existing checkpoint
+- `--simulations`: MCTS simulations per move (default: 800)
+- `--batch-size`: Batch size for MCTS leaf evaluation (default: 32)
+- `--collectors`: Number of leaf collector threads (default: 2)
+- `--verbose`: Print detailed information
+
+### Asynchronous Training
+
+Run training with separate self-play and training processes:
 
 ```bash
-python main.py train --time-based-search --search-time 1.5
+python main_optimized.py async --collectors 4 --hours 12
 ```
+
+Options:
+- `--hours`: Training duration in hours (None = indefinite)
+- `--checkpoint`: Checkpoint to load
+- `--collectors`: Number of experience collectors
 
 ### Evaluation
 
 Evaluate a trained model:
 
 ```bash
-python main.py eval --checkpoint model_latest --games 20
+python main_optimized.py eval --checkpoint model_latest --games 20
 ```
 
-### Hyperparameter Optimization
+### Performance Benchmarking
 
-The project includes a comprehensive hyperparameter optimization system built on Ray Tune. This allows you to systematically search for optimal hyperparameters across your entire training pipeline.
-
-#### Running Hyperparameter Tuning
-
-Basic tuning with default settings:
+Benchmark MCTS performance with different configurations:
 
 ```bash
-python main.py tune --games 50 --trials 10
+python main_optimized.py benchmark --simulations 800 --batch-size 64 --collectors 8 --games 5
 ```
 
-Advanced tuning with resource configuration:
+## Hardware Optimization
+
+This implementation includes sophisticated optimizations for modern multi-core CPUs and GPUs:
+
+### CPU Optimization
+
+For optimal performance on multi-core systems:
 
 ```bash
-python main.py tune --games 50 --trials 20 --cpus 8 --gpus 1 --concurrent-trials 4 --search-algo bayesopt --scheduler asha
+# For 12-core CPU (e.g., Ryzen 9 5900X)
+python main_optimized.py train --collectors 8 --batch-size 64
 ```
 
-Available options:
-- `--games`: Number of games for each trial
-- `--trials`: Total number of configurations to try
-- `--concurrent-trials`: Number of trials to run in parallel
-- `--cpus`, `--gpus`: Total resources to allocate
-- `--cpus-per-trial`, `--gpus-per-trial`: Resources per trial
-- `--search-algo`: Search algorithm (random, bayesopt, hyperopt)
-- `--scheduler`: Scheduler for early stopping (asha, pbt, none)
-- `--output-dir`: Directory for results
-- `--resume`: Resume previous tuning session
+Key parameters to adjust:
+- `collectors`: Set to approximately 75% of physical cores
+- `batch-size`: Larger values reduce overhead but increase latency
 
-#### Analyzing Tuning Results
+### GPU Optimization
 
-After running hyperparameter optimization, you can analyze the results:
+For optimal GPU utilization (NVIDIA RTX series):
 
 ```bash
-python main.py analyze ./ray_results/latest_experiment --all
+# For RTX 3060 Ti or similar
+python main_optimized.py train --batch-size 256 --no-mixed-precision False
 ```
 
-Generate specific visualizations:
-
-```bash
-python main.py analyze ./ray_results/latest_experiment --learning-curves --parameter-importance --output-dir ./analysis
-```
-
-Apply the best configuration to a file:
-
-```bash
-python main.py analyze ./ray_results/latest_experiment --apply-best
-```
-
-Analysis options:
-- `--learning-curves`: Plot learning curves for top configurations
-- `--parameter-importance`: Visualize parameter impact on performance
-- `--pairwise`: Plot pairwise relationships between parameters
-- `--parallel-coords`: Create parallel coordinates plots
-- `--print-best`: Print details of best configurations
-- `--apply-best`: Generate a new config file with best parameters
-- `--all`: Run all analyses
-- `--metric`: Metric to optimize (default: loss)
-- `--mode`: Optimization mode (min or max)
-- `--top-n`: Number of top configurations to consider
-
-#### Hyperparameters Being Optimized
-
-The optimization system tunes parameters across the entire pipeline:
-
-- **Learning parameters**: Learning rates, weight decay, batch sizes
-- **MCTS parameters**: Simulation counts, batch sizes, exploration weights
-- **Temperature parameters**: Initial and final temperatures, decay schedule
-- **Inference server parameters**: Batch wait times, cache sizes, max batch sizes
-- **Search strategy parameters**: Parallel vs. batched search, time-based vs. simulation-based
+The implementation automatically:
+- Uses mixed precision (FP16) when available
+- Adapts batch wait times to maximize GPU utilization
+- Implements efficient cache management to reduce redundant computations
 
 ## Extending the Project
 
 ### Adding New Games
 
-1. Implement the `GameState` interface in `utils/game_interface.py`
-2. Create a new state implementation similar to `TicTacToeState`
-3. Update model architecture if necessary
-
-### Customizing Hyperparameter Search
-
-Modify `hyperparameter_tuning.py` to customize the search space:
+1. Implement the `GameState` interface in `utils/game_interface.py`:
 
 ```python
-def get_search_space():
-    return {
-        # Add or modify parameters as needed
-        "LEARNING_RATE": tune.loguniform(1e-5, 1e-2),
-        "MY_NEW_PARAMETER": tune.choice([1, 2, 3]),
-        # ...
-    }
+class MyGameState(GameState):
+    def is_terminal(self) -> bool:
+        # Implementation
+        
+    def get_legal_actions(self) -> list:
+        # Implementation
+        
+    def apply_action(self, action) -> 'GameState':
+        # Implementation
+        
+    def get_winner(self):
+        # Implementation
+        
+    def encode(self):
+        # Implementation for neural network input
 ```
 
-## Performance Considerations
+2. Update the model architecture in `model.py` if necessary
+3. Register your game in `config.py`
 
-- For maximum performance, use parallel MCTS with batch inference
-- GPU acceleration provides significant speedups for model inference
-- Adjust batch sizes based on your hardware capabilities
-- Consider time-based search for more consistent move timing
+### Custom Neural Network Models
+
+Modify the `model.py` file to implement your architecture:
+
+```python
+class MyCustomModel(nn.Module):
+    def __init__(self, input_shape, action_size):
+        super().__init__()
+        # Define your layers
+        
+    def forward(self, x):
+        # Implementation
+        policy = ...
+        value = ...
+        return policy, value
+```
+
+### Distributed Training
+
+For multi-node training:
+
+1. Initialize Ray with cluster settings in `improved_ray_manager.py`
+2. Adjust resource allocation based on your cluster configuration
+3. Use the asynchronous training mode with `main_optimized.py async`
+
+## Performance Tuning
+
+### Batch Size Selection
+
+For optimal performance, adjust batch sizes based on hardware:
+
+- **CPU-constrained**: Smaller batches (16-32)
+- **GPU-constrained**: Larger batches (128-512)
+- **Balanced**: Medium batches (64-128)
+
+### Memory Optimization
+
+The implementation includes several memory optimization strategies:
+
+- Efficient state representation with `__slots__`
+- Caching with key-based lookup
+- Numpy arrays with appropriate data types
+- Binary serialization for state transmission
+
+### Parallelism Control
+
+Adjust parallelism based on your specific hardware:
+
+- `num_collectors`: Number of tree exploration threads (typically 2-12)
+- `batch_size`: Size of evaluation batches (16-512)
+- `adaptive_batching`: Enables dynamic adjustment during execution
+
+## Troubleshooting
+
+### Common Issues
+
+- **Out of memory errors**: Reduce `cache_size` and `replay_buffer_size`
+- **Poor GPU utilization**: Increase `batch_size` and enable mixed precision
+- **High CPU usage**: Reduce `num_collectors` or limit CPU with `--cpu-limit`
+- **Stalled search**: Check for bottlenecks with `--verbose` option
+- **Slow training**: Increase `simulations` for better model convergence
+
+### Performance Monitoring
+
+The implementation includes detailed performance monitoring:
+
+```bash
+python main_optimized.py benchmark --verbose
+```
+
+This provides metrics on:
+- Tree exploration efficiency
+- Batch size distribution
+- GPU utilization
+- Cache hit rates
+- Search time breakdown
+
+## Future Improvements
+
+Based on detailed assessment, future development will focus on:
+
+1. Further improving CPU parallelism with finer-grained locking
+2. Enhancing game abstraction for greater flexibility
+3. Optimizing inference for specific GPU architectures
+4. Implementing subtree reuse between consecutive moves
+5. Strengthening error handling and diagnostic capabilities
 
 ## License
 
