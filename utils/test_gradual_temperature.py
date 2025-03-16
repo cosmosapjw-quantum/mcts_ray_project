@@ -1,8 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from utils.state_utils import TicTacToeState
-from utils.connect_four_game import ConnectFourState
-from utils.gradual_temperature import apply_gradual_temperature, visualize_temperature_distribution
+from utils.state_utils import ConnectFourState
+from utils.mcts_utils import apply_gradual_temperature, visualize_temperature_distribution
 
 def test_gradual_temperature_tictactoe():
     """Test and visualize gradual temperature effect on TicTacToe"""
