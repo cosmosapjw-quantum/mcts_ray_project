@@ -1,10 +1,12 @@
 # mcts/node.py
 import numpy as np
+import threading
 
 class Node:
-    """Enhanced tree node with improved memory efficiency"""
+    """Enhanced tree node with improved memory efficiency and per-node locking"""
     __slots__ = ('state', 'parent', 'children', 'visits', 'value', 'prior', 'action', 
-                'is_expanded', '_in_progress', '_has_legal_actions', '_legal_actions_cache')
+                'is_expanded', '_in_progress', '_has_legal_actions', '_legal_actions_cache',
+                'node_lock')  # Add node-level lock
     
     def __init__(self, state, parent=None, prior=0.0, action=None):
         self.state = state
@@ -16,6 +18,7 @@ class Node:
         self.action = action
         self.is_expanded = False
         self._in_progress = False  # For thread coordination
+        self.node_lock = threading.RLock()  # Add per-node lock
         
         # Cache legal actions calculation for efficiency
         self._has_legal_actions = None

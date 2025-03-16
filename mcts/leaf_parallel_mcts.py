@@ -1,6 +1,8 @@
 # mcts/leaf_parallel_mcts.py - Fixed implementation
 import time
 import threading
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 import queue
 import numpy as np
 import logging
@@ -12,20 +14,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("LeafParallelMCTS")
 
 class LeafParallelMCTS:
-    """Leaf parallelization MCTS with adaptive parameters"""
+    """Leaf parallelization MCTS with adaptive parameters and enhanced thread management"""
     
     def __init__(self, 
                 inference_fn: Callable,
-                num_collectors: int = 2,
-                batch_size: int = 32,
+                num_collectors: int = 8,      # Increased default from 2 to 8
+                batch_size: int = 64,
                 exploration_weight: float = 1.4,
                 collect_stats: bool = True,
                 collector_timeout: float = 0.01,
-                min_batch_size: int = 8,
+                min_batch_size: int = 16,      # Increased from 8 to 16
                 evaluator_wait_time: float = 0.02,
                 verbose: bool = False,
-                adaptive_parameters: bool = True):  # New parameter
-        """Initialize with adaptive parameters option"""
+                adaptive_parameters: bool = True):
+        """Initialize with improved thread management and synchronization"""
         # Store all parameters
         self.inference_fn = inference_fn
         self.num_collectors = num_collectors
@@ -39,7 +41,7 @@ class LeafParallelMCTS:
         self.adaptive_parameters = adaptive_parameters
         
         # Create thread-safe resources
-        self.tree_lock = threading.RLock()
+        self.tree_lock = threading.RLock()  # Global lock for shared data structures
         self.eval_queue = queue.Queue()
         self.result_queue = queue.Queue()
         
@@ -64,6 +66,15 @@ class LeafParallelMCTS:
             'batch_sizes': [],
             'collection_success_rate': []
         }
+        
+        # Thread pool for collectors (alternative to individual threads)
+        self.use_thread_pool = True  # Flag to control whether to use thread pool
+        if self.use_thread_pool:
+            from concurrent.futures import ThreadPoolExecutor
+            self.collector_pool = ThreadPoolExecutor(
+                max_workers=self.num_collectors,
+                thread_name_prefix="leaf_collector_"
+            )
         
         logger.info(f"LeafParallelMCTS initialized with {num_collectors} collectors, " +
                    f"batch_size={batch_size}, exploration_weight={exploration_weight}" +
@@ -293,30 +304,49 @@ class LeafParallelMCTS:
         return root, stats
     
     def _start_workers(self, root):
-        """Start worker threads for search"""
+        """Start worker threads for search with improved thread management"""
         
-        # Create and start leaf collectors
-        self.collectors = []
-        for i in range(self.num_collectors):
-            collector = LeafCollector(
-                root=root,
-                eval_queue=self.eval_queue,
-                result_queue=self.result_queue,
-                lock=self.tree_lock,
-                batch_size=max(1, self.batch_size // self.num_collectors),
-                max_queue_size=self.batch_size * 2,
-                exploration_weight=self.exploration_weight,
-                max_collection_time=self.collector_timeout,
-                expanded_nodes=self.expanded_nodes,
-                pending_nodes=self.pending_nodes
-            )
-            thread = threading.Thread(
-                target=collector.run,
-                daemon=True,
-                name=f"leaf_collector_{i}"
-            )
-            thread.start()
-            self.collectors.append((collector, thread))
+        if self.use_thread_pool:
+            # Use thread pool for collectors
+            self.collector_futures = []
+            for i in range(self.num_collectors):
+                collector = LeafCollector(
+                    root=root,
+                    eval_queue=self.eval_queue,
+                    result_queue=self.result_queue,
+                    lock=self.tree_lock,  # Pass tree_lock as 'lock' for backward compatibility
+                    batch_size=max(1, self.batch_size // self.num_collectors),
+                    max_queue_size=self.batch_size * 2,
+                    exploration_weight=self.exploration_weight,
+                    max_collection_time=self.collector_timeout,
+                    expanded_nodes=self.expanded_nodes,
+                    pending_nodes=self.pending_nodes
+                )
+                future = self.collector_pool.submit(collector.run)
+                self.collector_futures.append((collector, future))
+        else:
+            # Traditional approach with individual threads
+            self.collectors = []
+            for i in range(self.num_collectors):
+                collector = LeafCollector(
+                    root=root,
+                    eval_queue=self.eval_queue,
+                    result_queue=self.result_queue,
+                    lock=self.tree_lock,  # Pass tree_lock as 'lock' for backward compatibility
+                    batch_size=max(1, self.batch_size // self.num_collectors),
+                    max_queue_size=self.batch_size * 2,
+                    exploration_weight=self.exploration_weight,
+                    max_collection_time=self.collector_timeout,
+                    expanded_nodes=self.expanded_nodes,
+                    pending_nodes=self.pending_nodes
+                )
+                thread = threading.Thread(
+                    target=collector.run,
+                    daemon=True,
+                    name=f"leaf_collector_{i}"
+                )
+                thread.start()
+                self.collectors.append((collector, thread))
         
         # Create and start evaluator with improved parameters and verbose flag
         self.evaluator = Evaluator(
@@ -353,18 +383,37 @@ class LeafParallelMCTS:
         self.processor_thread.start()
     
     def _shutdown_workers(self):
-        """Shutdown worker threads"""
+        """Shutdown worker threads with improved cleanup"""
         # Signal shutdown
-        for collector, _ in self.collectors:
-            collector.shutdown()
+        self.shutdown_flag.set()
+        
+        # Shutdown collectors
+        if self.use_thread_pool:
+            # Shutdown with thread pool approach
+            for collector, future in self.collector_futures:
+                collector.shutdown()
+            
+            # Shutdown the thread pool with a timeout
+            self.collector_pool.shutdown(wait=False)
+            
+            # Give a brief timeout for collector futures
+            for _, future in self.collector_futures:
+                try:
+                    future.result(timeout=0.5)  # Wait up to 0.5s for each collector
+                except:
+                    pass  # Ignore errors during shutdown
+        else:
+            # Traditional approach
+            for collector, thread in self.collectors:
+                collector.shutdown()
+                thread.join(timeout=0.5)  # Increased timeout
+        
+        # Shutdown evaluator and result processor
         if self.evaluator:
             self.evaluator.shutdown()
         if self.processor:
             self.processor.shutdown()
         
-        # Wait for threads to exit (with timeout)
-        for _, thread in self.collectors:
-            thread.join(timeout=0.5)  # Increased timeout
         if self.evaluator_thread:
             self.evaluator_thread.join(timeout=0.5)  # Increased timeout
         if self.processor_thread:
@@ -572,7 +621,8 @@ class LeafCollector:
         self.root = root
         self.eval_queue = eval_queue
         self.result_queue = result_queue
-        self.lock = lock
+        self.tree_lock = lock  # Explicitly store as tree_lock
+        self.lock = lock       # Keep for backward compatibility
         self.batch_size = batch_size
         self.max_queue_size = max_queue_size
         self.exploration_weight = exploration_weight
@@ -659,7 +709,7 @@ class LeafCollector:
         visited_nodes = set()
         
         # Get a snapshot of expanded and pending nodes to reduce lock contention
-        with self.lock:
+        with self.tree_lock:
             local_expanded = set(self.expanded_nodes)
             local_pending = set(self.pending_nodes)
         
@@ -685,7 +735,7 @@ class LeafCollector:
                 
                 # Handle terminal nodes - process immediately
                 if leaf.state.is_terminal():
-                    with self.lock:  # Brief lock to get consistent result
+                    with self.tree_lock:  # Brief lock to get consistent result
                         value = leaf.state.get_winner()
                     self.result_queue.put((leaf, path, (value, None)))
                     retries += 1
@@ -708,7 +758,7 @@ class LeafCollector:
                     continue
                 
                 # Node is eligible, acquire lock to update tree state
-                with self.lock:
+                with self.tree_lock:
                     # Double-check status under lock (might have changed)
                     if (leaf.is_expanded or 
                         leaf_id in self.expanded_nodes or 
@@ -733,7 +783,7 @@ class LeafCollector:
             for leaf, path in bypassed_nodes[:target_size]:
                 leaf_id = id(leaf)
                 # Double-check status before using
-                with self.lock:
+                with self.tree_lock:
                     if not (leaf.is_expanded or 
                             leaf_id in self.expanded_nodes or 
                             leaf_id in self.pending_nodes):
@@ -1449,16 +1499,63 @@ class MCTSPerformanceMonitor:
         
         return report
 
-def _default_select(node, exploration_weight):
-    """PUCT-based leaf selection with diversity"""
-    # Import within function to avoid circular imports
-    from mcts.core import select_node
+def select_node_with_node_locks(node, exploration_weight=1.4):
+    """
+    Select a leaf node using PUCT algorithm with node-level locking.
     
-    # CRITICAL FIX: Add randomness for exploration diversity
-    if np.random.random() < 0.05:  # 5% chance of using random traversal
-        return _random_select(node)
+    Args:
+        node: Root node to start selection from
+        exploration_weight: Controls exploration vs exploitation tradeoff
+        
+    Returns:
+        tuple: (leaf_node, path) - selected leaf node and path from root
+    """
+    path = [node]
+    
+    while True:
+        # Acquire node lock for reading
+        with node.node_lock:
+            # If node is a leaf (not expanded) or has no children, we're done
+            if not node.is_expanded or not node.children:
+                return node, path
+                
+            # Find best child according to UCB formula
+            best_score = float('-inf')
+            best_child = None
+            
+            for child in node.children:
+                # Skip if no visits (shouldn't happen normally)
+                if child.visits == 0:
+                    # Prioritize unexplored nodes
+                    score = float('inf')
+                else:
+                    # PUCT formula
+                    q_value = child.value / child.visits
+                    u_value = exploration_weight * child.prior * np.sqrt(node.visits) / (1 + child.visits)
+                    score = q_value + u_value
+                
+                if score > best_score:
+                    best_score = score
+                    best_child = child
+        
+        # Move to the best child (outside of lock)
+        node = best_child
+        path.append(node)
+        
+        # Apply virtual loss to discourage other threads selecting same path
+        with node.node_lock:
+            node.visits += 1  # Virtual visit
+            node.value -= 0.1  # Small negative bias
+
+# Update default select function to use this version
+def _default_select(node, exploration_weight=1.4):
+    """Default selection function with node-level locking"""
+    # Use node-level locking by default
+    if hasattr(node, 'node_lock'):
+        return select_node_with_node_locks(node, exploration_weight)
     else:
-        # Use standard UCB-based selection
+        # Fall back to standard selection if nodes don't have locks
+        from mcts.core import select_node
         return select_node(node, exploration_weight)
 
 def _random_select(node):
@@ -1484,31 +1581,54 @@ def _random_select(node):
     
     return node, path
 
-# Convenience function with improved error handling
+def get_optimal_collector_count():
+    """Determine optimal number of collector threads based on CPU cores"""
+    cpu_count = multiprocessing.cpu_count()
+    # For Ryzen 9 5900X with 12 cores / 24 threads:
+    # Use 75% of logical cores, leaving some for the main process and system
+    return max(2, min(int(cpu_count * 0.75), 16))
+
 def leaf_parallel_search(root_state, inference_fn, num_simulations=800, 
-                        num_collectors=2, batch_size=32, exploration_weight=1.4,
+                        num_collectors=None,  # Default to None for auto-detection
+                        batch_size=64, exploration_weight=1.4,
                         add_dirichlet_noise=True, collect_stats=True,
-                        collector_timeout=0.01, min_batch_size=8,
+                        collector_timeout=0.01, min_batch_size=16,
                         evaluator_wait_time=0.02, verbose=False,
-                        adaptive_parameters=True):  # Add adaptive parameters option
+                        adaptive_parameters=True):
     """
-    Run leaf-parallel MCTS search with adaptive parameters.
+    Run leaf-parallel MCTS search with adaptive parameters and optimal thread usage.
     
     Args:
-        [...existing parameters...]
-        adaptive_parameters: Whether to dynamically adjust parameters during search
+        root_state: Initial game state
+        inference_fn: Function to perform neural network inference
+        num_simulations: Number of simulations to run
+        num_collectors: Number of collector threads (None = auto-detect based on CPU cores)
+        batch_size: Maximum batch size for leaf evaluation
+        exploration_weight: Controls exploration vs exploitation tradeoff
+        add_dirichlet_noise: Whether to add Dirichlet noise at root
+        collect_stats: Whether to collect performance statistics
+        collector_timeout: Maximum collection time per batch
+        min_batch_size: Minimum batch size for efficient inference
+        evaluator_wait_time: Maximum wait time for batch formation
+        verbose: Whether to print detailed logging
+        adaptive_parameters: Whether to dynamically adjust parameters
         
     Returns:
-        tuple: (root_node, stats)
+        tuple: (root_node, statistics dictionary)
     """
     # Record start time for diagnostics
     search_start_time = time.time()
     
+    # Auto-detect collector count if not specified
+    if num_collectors is None:
+        num_collectors = get_optimal_collector_count()
+        logger.info(f"Auto-detected optimal collector count: {num_collectors}")
+    
     try:
         # Print parameter information
-        logger.info(f"Starting leaf parallel search with batching parameters: " 
-                 f"batch_size={batch_size}, min_batch_size={min_batch_size}, "
-                 f"collectors={num_collectors}, wait_time={evaluator_wait_time*1000:.1f}ms")
+        logger.info(f"Starting leaf parallel search with {num_collectors} collectors, " 
+                  f"batch_size={batch_size}, min_batch_size={min_batch_size}, "
+                  f"wait_time={evaluator_wait_time*1000:.1f}ms")
         
         # Enable debug logging if verbose
         if verbose:
@@ -1556,7 +1676,7 @@ def leaf_parallel_search(root_state, inference_fn, num_simulations=800,
         if legal_actions:
             from mcts.core import expand_node
             # Create uniform policy
-            policy = np.zeros(9)
+            policy = np.zeros(root_state.policy_size if hasattr(root_state, 'policy_size') else 9)
             for action in legal_actions:
                 policy[action] = 1.0 / len(legal_actions)
                 
