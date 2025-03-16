@@ -258,46 +258,235 @@ class EnhancedBatchInferenceServer:
         return results
     
     def _perform_inference(self, states):
-        """Perform neural network inference with optimized settings"""
+        """
+        Perform neural network inference with support for multiple game types.
+        This version handles states from different game implementations.
+        """
         import torch
         
         try:
-            # Convert states to numpy array then to tensor
-            # Extract board from state if it's an object, or use directly if it's a numpy array
-            if hasattr(states[0], 'board') and not isinstance(states[0].board, type(None)):
-                boards_array = np.array([s.board for s in states], dtype=np.float32)
-            elif hasattr(states[0], 'encode'):
-                # Use encode method if available
-                boards_array = np.array([s.encode() for s in states], dtype=np.float32)
-            else:
-                # Assume states are already numpy arrays
-                boards_array = np.array(states, dtype=np.float32)
-                
-            inputs = torch.tensor(boards_array, dtype=torch.float32).to(self.device)
+            # First, determine if all states are from the same game type
+            game_types = set()
+            for state in states:
+                game_types.add(state.game_name if hasattr(state, 'game_name') else type(state).__name__)
             
+            # If mixed game types (unlikely), process in separate batches
+            if len(game_types) > 1:
+                logger.warning(f"Mixed game types in batch: {game_types}")
+                
+                # Group states by game type
+                game_groups = {}
+                for i, state in enumerate(states):
+                    game_name = state.game_name if hasattr(state, 'game_name') else type(state).__name__
+                    if game_name not in game_groups:
+                        game_groups[game_name] = []
+                    game_groups[game_name].append((i, state))
+                
+                # Process each group separately
+                all_policies = [None] * len(states)
+                all_values = [None] * len(states)
+                
+                for game_name, state_group in game_groups.items():
+                    indices = [i for i, _ in state_group]
+                    group_states = [s for _, s in state_group]
+                    
+                    # Process this group
+                    group_policies, group_values = self._process_game_batch(group_states, game_name)
+                    
+                    # Fill in results
+                    for idx, policy, value in zip(indices, group_policies, group_values):
+                        all_policies[idx] = policy
+                        all_values[idx] = value
+                
+                return all_policies, all_values
+            
+            # Standard case: all states are from the same game
+            game_name = list(game_types)[0]
+            return self._process_game_batch(states, game_name)
+                
+        except Exception as e:
+            logger.error(f"Error during inference: {e}")
+            raise
+        
+    def _process_game_batch(self, states, game_name):
+        """
+        Process a batch of states from the same game type.
+        
+        Args:
+            states: List of game states of the same type
+            game_name: Name of the game type
+            
+        Returns:
+            tuple: (policies, values) as numpy arrays
+        """
+        import torch
+        
+        # Get policy size for this game (from registry if available)
+        if hasattr(states[0], 'policy_size'):
+            policy_size = states[0].policy_size
+        else:
+            try:
+                from utils.game_registry import GameRegistry
+                policy_size = GameRegistry.get_policy_size(game_name)
+            except Exception as e:
+                logger.warning(f"Could not determine policy size from registry: {e}")
+                # Fallback: guess based on first state
+                if hasattr(states[0], 'board') and hasattr(states[0].board, 'size'):
+                    policy_size = states[0].board.size
+                else:
+                    # Last resort: assume TicTacToe
+                    policy_size = 9
+                    logger.warning(f"Using fallback policy size of {policy_size} for {game_name}")
+        
+        # Convert states to tensor format using standardized encoding method
+        if hasattr(states[0], 'encode_for_inference'):
+            # Use game-specific encoding
+            try:
+                encoded_states = [state.encode_for_inference() for state in states]
+                batch_tensor = self._prepare_encoded_batch(encoded_states)
+            except Exception as e:
+                logger.error(f"Error encoding states: {e}, falling back to basic encoding")
+                encoded_states = [state.encode() for state in states]
+                batch_tensor = self._prepare_encoded_batch(encoded_states)
+        else:
+            # Use basic encoding
+            try:
+                encoded_states = [state.encode() for state in states]
+                batch_tensor = self._prepare_encoded_batch(encoded_states)
+            except Exception as e:
+                logger.error(f"Error encoding states: {e}, using fallback")
+                # Last resort: try to extract board
+                batch_tensor = self._extract_board_fallback(states)
+        
+        # Move to correct device
+        batch_tensor = batch_tensor.to(self.device)
+        
+        # Perform inference with proper error handling
+        try:
             # Use mixed precision if enabled
             if self.use_amp:
                 with torch.amp.autocast(device_type='cuda', dtype=self.amp_dtype):
                     with torch.no_grad():
-                        policy_batch, value_batch = self.model(inputs)
+                        policy_batch, value_batch = self.model(batch_tensor)
             else:
                 with torch.no_grad():
-                    policy_batch, value_batch = self.model(inputs)
+                    policy_batch, value_batch = self.model(batch_tensor)
                     
             # Move results back to CPU and convert to numpy
             policy_batch = policy_batch.cpu().numpy()
             value_batch = value_batch.cpu().numpy()
             
-            # Update GPU utilization estimate (very rough approximation)
+            # Update GPU utilization estimate
             batch_size_ratio = len(states) / self.max_batch_size
             self.gpu_utilization.append(batch_size_ratio)
             self.batch_fullness.append(batch_size_ratio)
             
-            return policy_batch, value_batch
+            # Mask illegal moves if needed
+            if hasattr(states[0], 'get_action_mask'):
+                for i, state in enumerate(states):
+                    mask = state.get_action_mask()
+                    
+                    # Apply mask - set illegal move probabilities to 0
+                    policy_batch[i] = policy_batch[i] * mask
+                    
+                    # Renormalize policy (if any legal moves remain)
+                    policy_sum = policy_batch[i].sum()
+                    if policy_sum > 0:
+                        policy_batch[i] /= policy_sum
+                    else:
+                        # If all moves were masked or sum is 0, use uniform policy over legal moves
+                        legal_actions = state.get_legal_actions()
+                        if legal_actions:
+                            uniform_prob = 1.0 / len(legal_actions)
+                            for action in legal_actions:
+                                policy_batch[i][action] = uniform_prob
             
+            return policy_batch, value_batch
+                
         except Exception as e:
-            logger.error(f"Error during inference: {e}")
-            raise
+            logger.error(f"Error during model inference: {e}")
+            # Provide fallback results
+            batch_size = len(states)
+            fallback_policies = np.zeros((batch_size, policy_size))
+            fallback_values = np.zeros((batch_size, 1))
+            
+            # Use uniform distribution over legal moves for each state
+            for i, state in enumerate(states):
+                legal_actions = state.get_legal_actions()
+                if legal_actions:
+                    uniform_prob = 1.0 / len(legal_actions)
+                    for action in legal_actions:
+                        fallback_policies[i][action] = uniform_prob
+                else:
+                    # If no legal actions, use uniform over all actions
+                    fallback_policies[i] = np.ones(policy_size) / policy_size
+            
+            return fallback_policies, fallback_values
+
+    def _prepare_encoded_batch(self, encoded_states):
+        """
+        Prepare a batch tensor from encoded states, handling different formats.
+        
+        Args:
+            encoded_states: List of encoded states (numpy arrays)
+            
+        Returns:
+            torch.Tensor: Batch tensor ready for model input
+        """
+        import torch
+        import numpy as np
+        
+        # Check for consistent shapes
+        shapes = set(tuple(state.shape) for state in encoded_states)
+        
+        if len(shapes) > 1:
+            # States have inconsistent shapes - need to handle separately
+            raise ValueError(f"Inconsistent shapes in batch: {shapes}")
+        
+        # Stack into a batch tensor
+        try:
+            # Try numpy stack first
+            batch = np.stack(encoded_states)
+            return torch.tensor(batch, dtype=torch.float32)
+        except Exception as e:
+            logger.error(f"Error stacking encoded states: {e}")
+            
+            # Fallback: convert individually
+            tensors = []
+            for state in encoded_states:
+                tensors.append(torch.tensor(state, dtype=torch.float32))
+            
+            return torch.stack(tensors)
+
+    def _extract_board_fallback(self, states):
+        """
+        Last resort fallback to extract board representations from states.
+        
+        Args:
+            states: List of game states
+            
+        Returns:
+            torch.Tensor: Batch tensor with basic board representation
+        """
+        import torch
+        import numpy as np
+        
+        # Try to extract board attribute
+        boards = []
+        for state in states:
+            if hasattr(state, 'board'):
+                if isinstance(state.board, np.ndarray):
+                    boards.append(state.board.astype(np.float32))
+                else:
+                    # Try to convert to numpy array
+                    boards.append(np.array(state.board, dtype=np.float32))
+            else:
+                # Create a zero board as placeholder - will give meaningless results
+                # but prevents complete failure
+                boards.append(np.zeros(9, dtype=np.float32))  # Assuming 3x3 board
+        
+        # Stack boards and convert to tensor
+        return torch.tensor(np.stack(boards), dtype=torch.float32)
     
     def _batch_worker(self):
         """Enhanced worker thread that processes the queue with adaptive batching"""

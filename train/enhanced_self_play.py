@@ -16,7 +16,7 @@ logger = logging.getLogger("EnhancedSelfPlay")
 # Import optimized components
 from utils.improved_ray_manager import RayActorManager, inference_server_health_check
 from inference.enhanced_batch_inference_server import EnhancedBatchInferenceServer
-from utils.optimized_state import OptimizedTicTacToeState
+from utils.optimized_state import TicTacToeState
 from mcts.leaf_parallel_mcts import leaf_parallel_search
 from mcts.node import Node
 
@@ -408,7 +408,7 @@ class EnhancedSelfPlayManager:
         start_time = time.time()
         
         # Use optimized state implementation
-        state = OptimizedTicTacToeState()
+        state = TicTacToeState()
         memory = []
         move_count = 0
         

@@ -15,7 +15,7 @@ Choose the appropriate implementation based on your needs:
 """
 from mcts.node import Node
 
-from .core import mcts_search_basic
+from .core import mcts_search
 from .tree import mcts_search_optimized
 from .leaf_parallel_mcts import leaf_parallel_search
 from .search import batched_mcts_search, parallel_mcts, mcts_with_timeout
@@ -25,7 +25,7 @@ from mcts.core import (
     select_node,
     expand_node,
     backpropagate,
-    mcts_search_basic
+    mcts_search
 )
 
 # Optimized implementations
@@ -47,7 +47,7 @@ from mcts.search import (
 def get_mcts_search(mode='optimized', **kwargs):
     """Get appropriate MCTS search function based on mode"""
     if mode == 'basic':
-        return mcts_search_basic
+        return mcts_search
     elif mode == 'optimized':
         return mcts_search_optimized
     elif mode == 'leaf_parallel':
