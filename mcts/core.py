@@ -108,22 +108,121 @@ def select_node(node, exploration_weight=1.4):
     
     return node, path
 
+def select_node_with_node_locks(node, exploration_weight=1.4):
+    """Select a leaf node using PUCT algorithm with proper virtual loss tracking"""
+    path = [node]
+    virtual_losses = {}  # Track all virtual losses applied
+
+    while node.is_expanded and node.children:
+        # Find best child according to UCB formula
+        best_score = float('-inf')
+        best_child = None
+        
+        with node.node_lock:
+            for child in node.children:
+                # Calculate UCB score
+                if child.visits == 0:
+                    score = float('inf')
+                else:
+                    q_value = child.value / child.visits
+                    u_value = exploration_weight * child.prior * np.sqrt(node.visits) / (1 + child.visits)
+                    score = q_value + u_value
+                
+                if score > best_score:
+                    best_score = score
+                    best_child = child
+            
+            # Lock best child before releasing parent lock
+            if best_child:
+                # Apply virtual loss atomically
+                virtual_losses[id(best_child)] = (best_child.visits, best_child.value)
+                best_child.visits += 1  # Virtual visit
+                best_child.value -= 0.1  # Small negative bias
+        
+        node = best_child
+        path.append(node)
+    
+    return node, path, virtual_losses
+
+# Update default select function to use this version
+def _default_select(node, exploration_weight=1.4):
+    """Default selection function with node-level locking"""
+    # Use node-level locking by default
+    if hasattr(node, 'node_lock'):
+        return select_node_with_node_locks(node, exploration_weight)
+    else:
+        # Fall back to standard selection if nodes don't have locks
+        from mcts.core import select_node
+        return select_node(node, exploration_weight)
+
+def _random_select(node):
+    """Random traversal to increase diversity"""
+    path = [node]
+    
+    while node.children:
+        # Randomly select child, weighted by prior probability
+        priors = np.array([child.prior for child in node.children])
+        # Ensure sum is 1
+        priors = priors / np.sum(priors) if np.sum(priors) > 0 else np.ones(len(priors)) / len(priors)
+        
+        # Sample index
+        try:
+            idx = np.random.choice(len(node.children), p=priors)
+            node = node.children[idx]
+        except:
+            # Fallback to uniform random selection
+            idx = np.random.randint(0, len(node.children))
+            node = node.children[idx]
+        
+        path.append(node)
+    
+    return node, path
+
+def backpropagate_with_virtual_loss(path, value, virtual_visits):
+    """
+    Backpropagate the evaluation through the path with virtual loss correction.
+    """
+    # Reverse the path to go from leaf to root
+    for node in reversed(path):
+        node_id = id(node)
+        
+        with node.node_lock:
+            # If this node had virtual loss applied during selection
+            if node_id in virtual_visits:
+                original_visits, original_value = virtual_visits[node_id]
+                
+                # First undo the virtual loss completely
+                node.visits = original_visits
+                node.value = original_value
+                
+                # Then apply the real update
+                node.visits += 1
+                node.value += value
+            else:
+                # Normal update for nodes without virtual loss
+                node.visits += 1
+                node.value += value
+        
+        # Flip value for opponent's perspective
+        value = -value
+
+class nullcontext:
+    def __enter__(self): return None
+    def __exit__(self, *args): pass
+
+# Modified core backpropagation to handle virtual loss
 def backpropagate(path, value):
     """
-    Update statistics for nodes in the path.
-    Game-agnostic version without any hardcoded parameters.
-    
-    Args:
-        path: List of nodes from root to leaf
-        value: Value to backpropagate
+    Update statistics for nodes in the path with proper visit accounting.
     """
-    # For each node in the path (from leaf to root)
     for node in reversed(path):
-        # Update node statistics
-        node.visits += 1
-        node.value += value
+        with node.node_lock if hasattr(node, 'node_lock') else nullcontext():
+            # Always add a real visit (virtual visit is separate)
+            node.visits += 1
+            # Add value with virtual loss compensation
+            node.value += value
         
-        # Flip value perspective for opponent
+        # Flip value for opponent's perspective
         value = -value
 
 def mcts_search(root_state, inference_fn, num_simulations, exploration_weight=1.4):

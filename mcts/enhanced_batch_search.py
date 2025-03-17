@@ -654,7 +654,7 @@ def test_optimized_search():
     inference_server = MockBatchInferenceServer(
         batch_wait=0.001,
         cache_size=1000,
-        max_batch_size=64
+        max_batch_size=256
     )
     
     # Create initial state
@@ -665,7 +665,7 @@ def test_optimized_search():
         state=state,
         inference_actor=inference_server,
         num_simulations=200,
-        batch_size=32,
+        batch_size=256,
         batch_strategy='balanced',
         adaptive_batching=True,
         verbose=True,

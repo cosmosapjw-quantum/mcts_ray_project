@@ -110,11 +110,12 @@ class RayActorManager:
         memory_bytes = int(self.memory_limit * 1024 * 1024 * 1024)
         object_store_bytes = int(self.object_store_limit * 1024 * 1024 * 1024)
         
-        # Additional system resources
+        # Configure Ray with better memory management
         system_config = {
-            "object_spilling_threshold": 0.8,  # More aggressive spilling to avoid OOM
-            "object_store_full_delay_ms": 100,  # Shorter delay when object store is full
-            "local_gc_interval_s": 30  # More frequent garbage collection
+            "object_spilling_threshold": 0.7,  # More aggressive spilling (down from 0.8)
+            "object_store_full_delay_ms": 50,   # Shorter delay (down from 100ms)
+            "local_gc_interval_s": 20,         # More frequent garbage collection
+            "memory_monitor_refresh_ms": 500   # Monitor memory more frequently
         }
 
         # Configure log limits to prevent excessive logging
@@ -258,6 +259,19 @@ class RayActorManager:
     def _create_single_actor(self, actor_class, actor_id, options, args):
         """Create a single actor with error handling"""
         try:
+            # For GPU actors, ensure memory is clean
+            if options.get('num_gpus', 0) > 0:
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        logger.info(f"Cleaned CUDA memory before creating actor {actor_id}")
+                        
+                        # Add a short wait to ensure memory is released
+                        time.sleep(2.0)
+                except ImportError:
+                    pass
+            
             # Create unique name for this actor
             logger.info(f"Creating actor {actor_id} with {options.get('num_cpus', 1)} CPUs and {options.get('num_gpus', 0)} GPUs")
             
@@ -428,11 +442,14 @@ class RayActorManager:
     
     def _recreate_actor(self, pool_name: str, actor_index: int):
         """
-        Recreate a failed actor with exponential backoff.
+        Recreate a failed actor with exponential backoff and improved error handling.
         
         Args:
             pool_name: Name of the actor pool
             actor_index: Index of the actor in the pool
+            
+        Returns:
+            bool: True if actor was successfully recreated, False otherwise
         """
         if pool_name not in self.actor_pools:
             logger.error(f"Cannot recreate actor in non-existent pool: {pool_name}")
@@ -469,24 +486,100 @@ class RayActorManager:
                 try:
                     ray.kill(config["actor"])
                     logger.info(f"Killed actor {actor_id}")
+                    
+                    # Important: Wait longer for GPU actors to free memory
+                    if "num_gpus" in config["options"] and config["options"]["num_gpus"] > 0:
+                        logger.info(f"Waiting longer for GPU memory to be released")
+                        time.sleep(5.0)  # Wait 5 seconds for GPU memory to be released
                 except Exception as e:
                     logger.debug(f"Error killing actor {actor_id}: {e}")
             
             # Set status to recreating
             config["status"] = "recreating"
             
-            # Wait with exponential backoff (0.5s, 1s, 2s, 4s, 8s)
-            backoff = min(8, 0.5 * (2 ** (config["restart_count"] - 1)))
-            logger.info(f"Waiting {backoff}s before recreating actor {actor_id} (attempt {config['restart_count']})")
+            # Calculate exponential backoff wait time
+            # 0.5s, 1s, 2s, 4s, 8s, 16s, max 30s
+            backoff = min(30.0, 0.5 * (2 ** (config["restart_count"] - 1)))
+            logger.info(f"Waiting {backoff:.1f}s before recreating actor {actor_id} (attempt {config['restart_count']})")
             time.sleep(backoff)
+            
+            # Create a new actor with extended options for reliability
+            creation_options = dict(config["options"])  # Copy the original options
+            
+            # For GPU actors, add special handling
+            if "num_gpus" in creation_options and creation_options["num_gpus"] > 0:
+                # Adjust resources slightly for better scheduling
+                # This helps Ray find a clean GPU slot
+                adjusted_gpu = max(0.1, creation_options["num_gpus"] * 0.95)
+                creation_options["num_gpus"] = adjusted_gpu
+                logger.info(f"Adjusted GPU allocation to {adjusted_gpu} for better scheduling")
+            
+            # Create actor with resource specifications
+            actor_with_resources = actor_class.options(**creation_options)
+            
+            # Create with extended timeout for initialization
+            new_actor = None
+            creation_timeout = 30.0  # 30 second timeout for actor creation
+            creation_start = time.time()
+            
+            # Create the actor and wait for it to be ready
+            new_actor = actor_with_resources.remote(**config["args"])
+            
+            # Verify actor is alive with simple ping
+            try:
+                # Try a simple method call to verify the actor is responsive
+                # Most actors support __ray_terminate__, so use that as a ping target
+                ray.get(new_actor.__ray_ping__.remote(), timeout=5.0)
+                logger.info(f"Successfully verified actor {actor_id} is responsive")
+            except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
+                # Actor failed immediately after creation
+                logger.error(f"Actor {actor_id} created but failed ping test: {e}")
+                if new_actor:
+                    try:
+                        ray.kill(new_actor)
+                    except:
+                        pass
+                raise ValueError(f"Actor created but failed verification")
+            
+            # For actors with health check methods, wait for ready state
+            if "health_check_method" in pool_info and pool_info["health_check_method"]:
+                health_method = pool_info["health_check_method"]
+                health_timeout = 10.0  # 10 second timeout for initial health check
                 
-            # Create a new actor
-            new_actor = self._create_single_actor(
-                actor_class=actor_class,
-                actor_id=actor_id,
-                options=config["options"],
-                args=config["args"]
-            )
+                try:
+                    # Call the health check method and wait for result
+                    health_result = ray.get(getattr(new_actor, health_method).remote(), timeout=health_timeout)
+                    
+                    # Check if result indicates the actor is healthy
+                    is_healthy = False
+                    if isinstance(health_result, bool):
+                        is_healthy = health_result
+                    elif isinstance(health_result, dict) and "status" in health_result:
+                        status = health_result["status"]
+                        # Consider "initializing" as healthy for new actors
+                        is_healthy = status in ["ready", "healthy", "ok", "initializing"]
+                    else:
+                        is_healthy = health_result is not None
+                    
+                    if not is_healthy:
+                        logger.error(f"Actor {actor_id} failed initial health check: {health_result}")
+                        if new_actor:
+                            try:
+                                ray.kill(new_actor)
+                            except:
+                                pass
+                        raise ValueError(f"Actor failed initial health check")
+                        
+                    logger.info(f"Actor {actor_id} passed initial health check")
+                    
+                except (ray.exceptions.GetTimeoutError, ray.exceptions.RayActorError) as e:
+                    logger.error(f"Health check failed for newly created actor {actor_id}: {e}")
+                    if new_actor:
+                        try:
+                            ray.kill(new_actor)
+                        except:
+                            pass
+                    raise ValueError(f"Actor health check failed: {e}")
             
             if new_actor:
                 # Replace in the configs and actors list
@@ -510,6 +603,13 @@ class RayActorManager:
         except Exception as e:
             logger.error(f"Error recreating actor {actor_id}: {e}")
             config["status"] = "failed"
+            
+            # If this was an early failure attempt, try one more time with more delay
+            if config["restart_count"] <= 2:
+                logger.info(f"Will retry recreation once more after extended delay")
+                time.sleep(10.0)  # longer delay for retry
+                return self._recreate_actor(pool_name, actor_index)  # One recursive retry
+                
             return False
     
     def get_actor(self, pool_name: str, strategy: str = "round_robin") -> Any:
@@ -663,7 +763,7 @@ def experience_collector_health_check(actor):
 def create_manager_with_inference_server(use_gpu=True, batch_wait=0.001, 
                                       cache_size=20000, max_batch_size=256,
                                       cpu_limit=None, gpu_fraction=1.0, 
-                                      use_mixed_precision=True):
+                                      use_mixed_precision=True, verbose=False):
     """
     Create a RayActorManager with a preconfigured inference server.
     
@@ -698,7 +798,8 @@ def create_manager_with_inference_server(use_gpu=True, batch_wait=0.001,
             "cache_size": cache_size,
             "max_batch_size": max_batch_size,
             "adaptive_batching": True,
-            "mixed_precision": use_mixed_precision
+            "mixed_precision": use_mixed_precision,
+            "verbose": verbose
         },
         per_actor_cpus=1.0,
         per_actor_gpus=gpu_fraction,

@@ -33,24 +33,24 @@ def main():
     
     # Standard training command
     train_parser = subparsers.add_parser('train', help='Run standard training')
-    train_parser.add_argument('--games', type=int, default=200, help='Number of games to play')
+    train_parser.add_argument('--games', type=int, default=500, help='Number of games to play')
     train_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load')
-    train_parser.add_argument('--simulations', type=int, default=800, help='MCTS simulations per move')
-    train_parser.add_argument('--batch-size', type=int, default=32, help='Batch size for MCTS')
-    train_parser.add_argument('--collectors', type=int, default=2, help='Number of leaf collectors')
+    train_parser.add_argument('--simulations', type=int, default=100, help='MCTS simulations per move')
+    train_parser.add_argument('--batch-size', type=int, default=256, help='Batch size for MCTS')
+    train_parser.add_argument('--collectors', type=int, default=10, help='Number of leaf collectors')
     train_parser.add_argument('--verbose', action='store_true', help='Print detailed information')
     
     # Async training command
     async_parser = subparsers.add_parser('async', help='Run asynchronous training')
     async_parser.add_argument('--hours', type=float, default=None, help='Training duration in hours (None = indefinite)')
     async_parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load')
-    async_parser.add_argument('--collectors', type=int, default=2, help='Number of experience collectors')
+    async_parser.add_argument('--collectors', type=int, default=8, help='Number of experience collectors')
     
     # Evaluate command
     eval_parser = subparsers.add_parser('eval', help='Evaluate a trained model')
     eval_parser.add_argument('--checkpoint', type=str, required=True, help='Checkpoint to evaluate')
-    eval_parser.add_argument('--games', type=int, default=10, help='Number of games to play')
-    eval_parser.add_argument('--simulations', type=int, default=800, help='MCTS simulations per move')
+    eval_parser.add_argument('--games', type=int, default=20, help='Number of games to play')
+    eval_parser.add_argument('--simulations', type=int, default=1200, help='MCTS simulations per move')
     
     # Benchmark command
     bench_parser = subparsers.add_parser('benchmark', help='Benchmark MCTS performance')
@@ -118,7 +118,7 @@ def main():
         parser.print_help()
 
 def run_standard_training(games, checkpoint=None, simulations=800, batch_size=32, 
-                         num_collectors=2, verbose=False, use_gpu=True, 
+                         num_collectors=8, verbose=False, use_gpu=True, 
                          use_mixed_precision=True, cpu_limit=None):
     """
     Run standard training using the enhanced self-play manager.
@@ -183,7 +183,7 @@ def run_standard_training(games, checkpoint=None, simulations=800, batch_size=32
         traceback.print_exc()
         sys.exit(1)
 
-def run_async_training(num_collectors=2, checkpoint=None, duration_hours=None,
+def run_async_training(num_collectors=8, checkpoint=None, duration_hours=None,
                       use_gpu=True, cpu_limit=None):
     """
     Run asynchronous training with separate self-play and training processes.
@@ -217,7 +217,8 @@ def run_async_training(num_collectors=2, checkpoint=None, duration_hours=None,
             max_batch_size=256,            # Increase batch size
             cpu_limit=cpu_limit,
             gpu_fraction=1.0,              # Use full GPU
-            use_mixed_precision=True
+            use_mixed_precision=True,
+            verbose=False
         )
         
         try:
@@ -268,7 +269,8 @@ def run_evaluation(checkpoint, games=10, simulations=800,
             max_batch_size=256,            # Increase batch size
             cpu_limit=cpu_limit,
             gpu_fraction=1.0,              # Use full GPU
-            use_mixed_precision=True
+            use_mixed_precision=True,
+            verbose=True
         )
         
         try:
@@ -330,7 +332,7 @@ def run_evaluation(checkpoint, games=10, simulations=800,
                         root_state=state,
                         inference_fn=inference_function,
                         num_simulations=simulations,
-                        num_collectors=2,
+                        num_collectors=8,
                         batch_size=32,
                         exploration_weight=1.4,
                         add_dirichlet_noise=False,  # No noise for evaluation
@@ -386,7 +388,7 @@ def run_evaluation(checkpoint, games=10, simulations=800,
         traceback.print_exc()
         sys.exit(1)
 
-def run_benchmark(simulations=800, batch_size=32, num_collectors=2, 
+def run_benchmark(simulations=800, batch_size=32, num_collectors=8, 
                  games=5, trials=3, use_gpu=True, cpu_limit=None):
     """
     Benchmark MCTS performance with different configurations.
@@ -418,7 +420,8 @@ def run_benchmark(simulations=800, batch_size=32, num_collectors=2,
             max_batch_size=256,            # Increase batch size
             cpu_limit=cpu_limit,
             gpu_fraction=1.0,              # Use full GPU
-            use_mixed_precision=True
+            use_mixed_precision=True,
+            verbose=True
         )
         
         try:            

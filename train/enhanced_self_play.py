@@ -5,6 +5,7 @@ Enhanced self-play manager with leaf parallelization and optimized components.
 import ray
 import time
 import logging
+import threading
 import numpy as np
 import torch
 from typing import Tuple, List, Any, Optional, Union
@@ -109,7 +110,8 @@ class EnhancedSelfPlayManager:
             max_batch_size=inference_server_max_batch_size,
             cpu_limit=cpu_limit,
             gpu_fraction=gpu_fraction,
-            use_mixed_precision=use_mixed_precision
+            use_mixed_precision=use_mixed_precision,
+            verbose=verbose
         )
         
         # Initialize model
@@ -198,7 +200,7 @@ class EnhancedSelfPlayManager:
             if isinstance(state_or_batch, list):
                 # CRITICAL FIX: For larger batches, split into smaller chunks to avoid timeout
                 batch_size = len(state_or_batch)
-                max_chunk_size = 32  # Maximum safe chunk size
+                max_chunk_size = 512  # Maximum safe chunk size
                 
                 if batch_size <= max_chunk_size:
                     # Process small batches directly
@@ -289,7 +291,7 @@ class EnhancedSelfPlayManager:
             action, probs = apply_temperature(visits, actions, temperature)
             
             # Create full policy vector
-            policy = visits_to_policy(visits, actions, board_size=9)  # Fixed size for TicTacToe
+            policy = visits_to_policy(visits, actions, policy_size=9)  # Fixed size for TicTacToe
             
             # Convert policy to tensor
             policy_tensor = torch.tensor(policy, dtype=torch.float).to(self.device)
@@ -344,54 +346,44 @@ class EnhancedSelfPlayManager:
             return False
             
     def _recreate_inference_server(self):
-        """Recreate the inference server if it's dead or unresponsive"""
         try:
-            logger.info("Attempting to recreate inference server")
-            
-            # Track attempt time
-            self._last_recreation_attempt = time.time()
-            
-            # Kill old server if it exists (ignore errors)
+            # Kill old server
             if self.inference_server:
-                try:
-                    ray.kill(self.inference_server)
-                except Exception as e:
-                    logger.debug(f"Error killing existing inference server: {e}")
-                    
-                # Wait to ensure it's gone
-                time.sleep(2.0)
+                ray.kill(self.inference_server)
+                time.sleep(3.0)  # Wait longer to ensure cleanup
             
-            # Create with maximum wait time
-            from inference.enhanced_batch_inference_server import EnhancedBatchInferenceServer
-            
-            # Use longer timeouts for creation and model loading
+            # Create new server
             self.inference_server = EnhancedBatchInferenceServer.options(
                 num_cpus=1.0,
                 num_gpus=1.0 if self.device.type == 'cuda' else 0.0
             ).remote(
-                initial_batch_wait=0.001,
+                # Reduce batch size for stability
+                max_batch_size=128,
+                initial_batch_wait=0.0005,
                 cache_size=20000,
-                max_batch_size=256,
-                adaptive_batching=True,
                 mixed_precision=self.use_mixed_precision
             )
-                
-            # Give it time to initialize basic structure
-            time.sleep(3.0)
-                
-            # Update model with extended timeout
-            state_dict = {}
-            for key, value in self.model.state_dict().items():
-                state_dict[key] = value.cpu().numpy()
-                
-            # Use longer timeout (20 seconds)
-            ray.get(self.inference_server.update_model.remote(state_dict), timeout=20.0)
             
-            logger.info("Successfully recreated inference server")
-            return True
+            # Extended wait for initialization
+            time.sleep(5.0)
+            
+            # Verify server is ready with a simple ping
+            try:
+                ray.get(self.inference_server.get_health_status.remote(), timeout=5.0)
+                logger.info("Successfully recreated inference server")
+                
+                # Update model in background
+                threading.Thread(
+                    target=self._update_model_on_server,
+                    daemon=True
+                ).start()
+                
+                return True
+            except Exception as e:
+                logger.error(f"New server failed health check: {e}")
+                return False
         except Exception as e:
             logger.error(f"Failed to recreate inference server: {e}")
-            # Set to None to avoid further usage attempts
             self.inference_server = None
             return False
     

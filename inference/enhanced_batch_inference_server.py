@@ -9,7 +9,6 @@ import threading
 import numpy as np
 import logging
 from collections import OrderedDict, deque
-from typing import Dict, List, Tuple, Any, Optional, Union
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -23,7 +22,8 @@ class EnhancedBatchInferenceServer:
                  max_batch_size=256,          # Larger batches
                  adaptive_batching=True,      # Enable adaptive
                  monitoring_interval=10.0,
-                 mixed_precision=True):
+                 mixed_precision=True,
+                 verbose=False):
         # Track creation time for health checks
         self.creation_time = time.time()
         
@@ -87,6 +87,8 @@ class EnhancedBatchInferenceServer:
         
         # Allow server to initialize asynchronously
         threading.Thread(target=self._delayed_setup, daemon=True).start()
+        
+        self.verbose = verbose
     
     def _delayed_setup(self):
         """Initialize PyTorch model after a short delay"""
@@ -112,6 +114,12 @@ class EnhancedBatchInferenceServer:
             # Initialize model and move to device
             self.model = SmallResNet()
             self.model.to(self.device)
+            
+            # Optimize memory format for Ampere architecture
+            if self.device.type == 'cuda' and torch.cuda.get_device_capability()[0] >= 8:
+                self.model = self.model.to(memory_format=torch.channels_last)
+                logger.info("Using channels_last memory format for Ampere architecture")
+                
             self.model.eval()
             
             # Enable auto-tuned CUDA kernels
@@ -138,8 +146,19 @@ class EnhancedBatchInferenceServer:
             logger.error(f"Model initialization failed: {e}")
             raise
     
-    def infer(self, state, priority=0):
-        """Request inference for a single state"""
+    def infer(self, state, retry_count=3, timeout=10.0, priority=0):
+        """
+        Request inference for a single state with improved error handling and retries.
+        
+        Args:
+            state: Game state to evaluate
+            retry_count: Number of retries on timeout/failure
+            timeout: Timeout in seconds for each attempt
+            priority: Priority level (higher = more urgent)
+        
+        Returns:
+            tuple: (policy, value) for the state
+        """
         # Ensure model is initialized
         if not self.setup_complete:
             self._setup()
@@ -164,23 +183,61 @@ class EnhancedBatchInferenceServer:
                 
                 return result
         
-        # Not in cache, queue for inference
-        result_queue = queue.Queue()
-        self.queues[min(priority, 3)].put((state, result_queue))
+        # Not in cache, attempt inference with retries
+        attempts = 0
+        last_error = None
         
-        # Wait for result with timeout to prevent deadlock
-        try:
-            result = result_queue.get(timeout=5.0)  # 5 second timeout
-            return result
-        except queue.Empty:
-            logger.warning("Inference request timed out, returning default values")
-            # Return default values
-            policy = np.ones(9) / 9  # Uniform policy for TicTacToe
-            value = 0.0
-            return (policy, value)
-    
-    def batch_infer(self, states, priority=0):
-        """Direct batch inference method for multiple states at once"""
+        while attempts < retry_count:
+            attempts += 1
+            
+            try:
+                # Not in cache, queue for inference
+                result_queue = queue.Queue()
+                self.queues[min(priority, 3)].put((state, result_queue))
+                
+                # Wait for result with timeout to prevent deadlock
+                result = result_queue.get(timeout=timeout)
+                
+                # Cache successful result
+                with self.cache_lock:
+                    self.cache[board_key] = result
+                    while len(self.cache) > self.cache_size:
+                        self.cache.popitem(last=False)
+                        
+                return result
+                
+            except queue.Empty:
+                last_error = "Timeout waiting for inference"
+                # Increase timeout for next attempt
+                timeout = timeout * 1.5
+                logger.warning(f"Inference timeout (attempt {attempts}/{retry_count}), retrying with longer timeout")
+                
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Inference error (attempt {attempts}/{retry_count}): {e}")
+                # Short delay before retry
+                time.sleep(0.1 * attempts)  # Increasing delay with each attempt
+        
+        # All attempts failed, return default values
+        logger.error(f"All inference attempts failed: {last_error}")
+        # Return default values
+        policy = np.ones(9) / 9  # Uniform policy for TicTacToe
+        value = 0.0
+        return (policy, value)
+
+    def batch_infer(self, states, retry_count=2, timeout=15.0, priority=0):
+        """
+        Direct batch inference method with improved error handling and memory management.
+        
+        Args:
+            states: List of states to evaluate
+            retry_count: Number of retries on timeout/failure
+            timeout: Timeout in seconds for the batch
+            priority: Priority level
+        
+        Returns:
+            list: List of (policy, value) tuples for each state
+        """
         # Ensure model is initialized
         if not self.setup_complete:
             self._setup()
@@ -189,6 +246,30 @@ class EnhancedBatchInferenceServer:
         self.total_batch_requests += 1
         num_states = len(states)
         self.total_requests += num_states
+        
+        # Proactively split very large batches to avoid GPU memory issues
+        if num_states > 128:
+            logger.info(f"Large batch of {num_states} states, splitting into smaller chunks")
+            results = []
+            chunk_size = min(64, self.max_batch_size // 2)  # Conservative chunking
+            
+            for i in range(0, num_states, chunk_size):
+                chunk_end = min(i + chunk_size, num_states)
+                batch_chunk = states[i:chunk_end]
+                chunk_size = len(batch_chunk)
+                
+                try:
+                    # Process each chunk with reduced timeout
+                    chunk_timeout = max(5.0, timeout * (chunk_size / num_states))
+                    chunk_results = self.batch_infer(batch_chunk, retry_count, chunk_timeout, priority)
+                    results.extend(chunk_results)
+                except Exception as e:
+                    logger.error(f"Error processing batch chunk {i//chunk_size}: {e}")
+                    # Return fallback results for this chunk
+                    fallback_results = [(np.ones(9)/9, 0.0) for _ in range(chunk_size)]
+                    results.extend(fallback_results)
+                    
+            return results
         
         # Check cache first for each state
         results = [None] * num_states
@@ -202,6 +283,12 @@ class EnhancedBatchInferenceServer:
                     results[i] = self.cache[board_key]
                     self.cache.move_to_end(board_key)
                     self.total_cache_hits += 1
+                    
+                    # Update cache hit statistics
+                    cache_keys = list(self.cache.keys())
+                    pos = cache_keys.index(board_key)
+                    decile = min(9, int(10 * pos / len(self.cache)))
+                    self.cache_hits_by_age[decile] += 1
                 else:
                     uncached_indices.append(i)
                     uncached_states.append(state)
@@ -209,104 +296,261 @@ class EnhancedBatchInferenceServer:
         # If all states were cached, return immediately
         if not uncached_states:
             return results
-            
-        # Process uncached states through neural network
+        
+        # Force CUDA memory cleanup before processing new batch
         try:
-            # Record batch size for stats
-            self.batch_sizes.append(len(uncached_states))
-            self.total_batches += 1
-            
-            # Perform inference
-            inference_start = time.time()
-            policy_batch, value_batch = self._perform_inference(uncached_states)
-            inference_time = time.time() - inference_start
-            self.inference_times.append(inference_time)
-            
-            # Update cache and fill results
-            with self.cache_lock:
-                for i, (idx, state) in enumerate(zip(uncached_indices, uncached_states)):
-                    # Safety check for index
-                    if i < len(policy_batch) and i < len(value_batch):
-                        result = (policy_batch[i], value_batch[i][0])
-                        
-                        # Update cache
-                        board_key = str(state.board if hasattr(state, 'board') else state)
-                        self.cache[board_key] = result
-                        
-                        # Fill in result
-                        results[idx] = result
-                    else:
-                        # Handle out of range indices (shouldn't happen but for safety)
-                        default_policy = np.ones(9) / 9
-                        default_value = 0.0
-                        results[idx] = (default_policy, default_value)
-                    
-                # Trim cache if needed
-                while len(self.cache) > self.cache_size:
-                    self.cache.popitem(last=False)
-                    
+            if hasattr(self, 'device') and self.device.type == 'cuda':
+                import torch
+                torch.cuda.empty_cache()
         except Exception as e:
-            logger.error(f"Batch inference error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.debug(f"Error cleaning CUDA cache: {e}")
+        
+        # Process uncached states through neural network with retries
+        attempts = 0
+        last_error = None
+        
+        while attempts < retry_count and uncached_states:
+            attempts += 1
             
-            # Return default values for uncached states
-            for idx in uncached_indices:
-                if results[idx] is None:  # Only fill in if not already set
-                    results[idx] = (np.ones(9)/9, 0.0)
+            try:
+                # Record batch size for stats
+                batch_size = len(uncached_states)
+                self.batch_sizes.append(batch_size)
+                self.total_batches += 1
                 
+                # Check for very small batches (possible stall recovery)
+                if batch_size == 1:
+                    logger.debug("Processing single-state batch")
+                
+                # Track memory usage before inference
+                mem_before = None
+                try:
+                    if hasattr(self, 'device') and self.device.type == 'cuda':
+                        import torch
+                        mem_before = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
+                except Exception:
+                    pass
+                    
+                # Perform inference with timeout monitoring
+                inference_start = time.time()
+                policy_batch, value_batch = self._perform_inference(uncached_states)
+                inference_time = time.time() - inference_start
+                
+                # Track memory usage after inference
+                try:
+                    if hasattr(self, 'device') and self.device.type == 'cuda' and mem_before is not None:
+                        import torch
+                        mem_after = torch.cuda.memory_allocated() / (1024 * 1024)  # MB
+                        mem_diff = mem_after - mem_before
+                        if mem_diff > 100:  # More than 100MB increase
+                            logger.warning(f"Large memory increase during inference: {mem_diff:.1f}MB for batch of {batch_size}")
+                except Exception:
+                    pass
+                
+                self.inference_times.append(inference_time)
+                
+                # Validate results shape
+                if len(policy_batch) != batch_size or len(value_batch) != batch_size:
+                    logger.warning(f"Result size mismatch: got {len(policy_batch)} policies and {len(value_batch)} values for {batch_size} states")
+                    
+                    # Ensure correct lengths by truncating or padding
+                    if len(policy_batch) > batch_size:
+                        policy_batch = policy_batch[:batch_size]
+                    if len(value_batch) > batch_size:
+                        value_batch = value_batch[:batch_size]
+                        
+                    # Pad with defaults if needed
+                    while len(policy_batch) < batch_size:
+                        policy_batch = np.append(policy_batch, [np.ones(9)/9], axis=0)
+                    while len(value_batch) < batch_size:
+                        value_batch = np.append(value_batch, [[0.0]], axis=0)
+                
+                # Update cache and fill results
+                with self.cache_lock:
+                    for i, (idx, state) in enumerate(zip(uncached_indices, uncached_states)):
+                        # Safety check for index
+                        if i < len(policy_batch) and i < len(value_batch):
+                            result = (policy_batch[i], value_batch[i][0] if value_batch[i].size > 0 else 0.0)
+                            
+                            # Update cache
+                            board_key = str(state.board if hasattr(state, 'board') else state)
+                            self.cache[board_key] = result
+                            
+                            # Fill in result
+                            results[idx] = result
+                        else:
+                            # Handle out of range indices (shouldn't happen but for safety)
+                            default_policy = np.ones(9) / 9
+                            default_value = 0.0
+                            results[idx] = (default_policy, default_value)
+                    
+                    # Trim cache if needed
+                    while len(self.cache) > self.cache_size:
+                        self.cache.popitem(last=False)
+                        
+                # All processed successfully
+                break
+                    
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Batch inference error (attempt {attempts}/{retry_count}): {e}")
+                
+                # If error was severe, throttle retries and possibly split the batch
+                severe_error = any(term in str(e).lower() for term in 
+                                ["cuda", "memory", "gpu", "device", "timeout", "ray"])
+                
+                if severe_error and batch_size > 16:
+                    logger.warning(f"Severe error with batch size {batch_size}, splitting in half for retry")
+                    
+                    # Split the batch and process each half separately
+                    half = batch_size // 2
+                    first_half_indices = uncached_indices[:half]
+                    first_half_states = uncached_states[:half]
+                    second_half_indices = uncached_indices[half:]
+                    second_half_states = uncached_states[half:]
+                    
+                    # Process first half
+                    try:
+                        half_timeout = max(5.0, timeout / 2)
+                        policy_batch_1, value_batch_1 = self._perform_inference(first_half_states)
+                        
+                        # Update results with first half
+                        for i, (idx, state) in enumerate(zip(first_half_indices, first_half_states)):
+                            if i < len(policy_batch_1) and i < len(value_batch_1):
+                                result = (policy_batch_1[i], value_batch_1[i][0] if value_batch_1[i].size > 0 else 0.0)
+                                results[idx] = result
+                                
+                                # Update cache
+                                with self.cache_lock:
+                                    board_key = str(state.board if hasattr(state, 'board') else state)
+                                    self.cache[board_key] = result
+                    except Exception as inner_e:
+                        logger.error(f"Error processing first half batch: {inner_e}")
+                        # Fill with defaults
+                        for idx in first_half_indices:
+                            results[idx] = (np.ones(9)/9, 0.0)
+                    
+                    # Process second half
+                    try:
+                        policy_batch_2, value_batch_2 = self._perform_inference(second_half_states)
+                        
+                        # Update results with second half
+                        for i, (idx, state) in enumerate(zip(second_half_indices, second_half_states)):
+                            if i < len(policy_batch_2) and i < len(value_batch_2):
+                                result = (policy_batch_2[i], value_batch_2[i][0] if value_batch_2[i].size > 0 else 0.0)
+                                results[idx] = result
+                                
+                                # Update cache
+                                with self.cache_lock:
+                                    board_key = str(state.board if hasattr(state, 'board') else state)
+                                    self.cache[board_key] = result
+                    except Exception as inner_e:
+                        logger.error(f"Error processing second half batch: {inner_e}")
+                        # Fill with defaults
+                        for idx in second_half_indices:
+                            results[idx] = (np.ones(9)/9, 0.0)
+                    
+                    # Consider batch processed after split handling
+                    break
+                
+                else:
+                    # For non-severe errors or small batches, just wait and retry
+                    sleep_time = min(2.0, 0.5 * attempts)
+                    logger.warning(f"Waiting {sleep_time:.1f}s before retry")
+                    time.sleep(sleep_time)
+                    
+                    # Force CUDA memory cleanup
+                    try:
+                        if hasattr(self, 'device') and self.device.type == 'cuda':
+                            import torch
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+        
+        # Fill in any remaining uncached results with default values
+        for idx in uncached_indices:
+            if results[idx] is None:
+                logger.warning(f"Using default values for state at index {idx} after all attempts failed")
+                results[idx] = (np.ones(9)/9, 0.0)
+        
+        # Verify that all results are populated
+        for i, result in enumerate(results):
+            if result is None:
+                logger.error(f"Result at index {i} is still None, using default")
+                results[i] = (np.ones(9)/9, 0.0)
+        
         return results
     
     def _perform_inference(self, states):
         """
-        Perform neural network inference with support for multiple game types.
-        This version handles states from different game implementations.
+        Perform neural network inference with proper error handling.
         """
         import torch
         
         try:
-            # First, determine if all states are from the same game type
-            game_types = set()
-            for state in states:
-                game_types.add(state.game_name if hasattr(state, 'game_name') else type(state).__name__)
+            # Force memory cleanup before large batches
+            if len(states) > 32 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            # Perform inference with timeout tracking
+            start_time = time.time()
+            max_inference_time = 5.0  # 5 second timeout
             
-            # If mixed game types (unlikely), process in separate batches
-            if len(game_types) > 1:
-                logger.warning(f"Mixed game types in batch: {game_types}")
-                
-                # Group states by game type
-                game_groups = {}
-                for i, state in enumerate(states):
-                    game_name = state.game_name if hasattr(state, 'game_name') else type(state).__name__
-                    if game_name not in game_groups:
-                        game_groups[game_name] = []
-                    game_groups[game_name].append((i, state))
-                
-                # Process each group separately
-                all_policies = [None] * len(states)
-                all_values = [None] * len(states)
-                
-                for game_name, state_group in game_groups.items():
-                    indices = [i for i, _ in state_group]
-                    group_states = [s for _, s in state_group]
-                    
-                    # Process this group
-                    group_policies, group_values = self._process_game_batch(group_states, game_name)
-                    
-                    # Fill in results
-                    for idx, policy, value in zip(indices, group_policies, group_values):
-                        all_policies[idx] = policy
-                        all_values[idx] = value
-                
-                return all_policies, all_values
+            # Move to correct device with error handling
+            batch_tensor = self._prepare_encoded_batch(states)
+            batch_tensor = batch_tensor.to(self.device)
             
-            # Standard case: all states are from the same game
-            game_name = list(game_types)[0]
-            return self._process_game_batch(states, game_name)
+            # More aggressive batch splitting for high memory usage
+            if len(states) > 32 and torch.cuda.is_available():
+                # Check memory usage
+                if torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() > 0.7:  # Lower threshold
+                    logger.warning(f"High memory usage, splitting batch of {len(states)}")
+                    half_point = len(states) // 2
+                    results_1 = self._perform_inference(states[:half_point])
+                    results_2 = self._perform_inference(states[half_point:])
+                    return [
+                        np.concatenate([results_1[0], results_2[0]]),
+                        np.concatenate([results_1[1], results_2[1]])
+                    ]
+            
+            # Use mixed precision if enabled
+            if self.use_amp:
+                with torch.amp.autocast(device_type='cuda', dtype=self.amp_dtype):
+                    with torch.no_grad():
+                        policy_batch, value_batch = self.model(batch_tensor)
+            else:
+                with torch.no_grad():
+                    policy_batch, value_batch = self.model(batch_tensor)
+            
+            # Check for timeout
+            if time.time() - start_time > max_inference_time:
+                logger.warning(f"Inference timeout after {time.time() - start_time:.1f}s")
+                raise TimeoutError("Inference took too long")
+                
+            # Move results back to CPU and convert to numpy
+            policy_batch = policy_batch.cpu().numpy()
+            value_batch = value_batch.cpu().numpy()
+            
+            return policy_batch, value_batch
                 
         except Exception as e:
-            logger.error(f"Error during inference: {e}")
-            raise
+            logger.error(f"Error during model inference: {e}")
+            # Provide fallback results
+            batch_size = len(states)
+            policy_size = getattr(states[0], 'policy_size', 9)
+            fallback_policies = np.zeros((batch_size, policy_size))
+            fallback_values = np.zeros((batch_size, 1))
+            
+            # Use uniform distribution for policies
+            for i, state in enumerate(states):
+                actions = state.get_legal_actions()
+                if actions:
+                    for action in actions:
+                        fallback_policies[i][action] = 1.0 / len(actions)
+                else:
+                    fallback_policies[i] = np.ones(policy_size) / policy_size
+            
+            return fallback_policies, fallback_values
         
     def _process_game_batch(self, states, game_name):
         """
@@ -491,110 +735,148 @@ class EnhancedBatchInferenceServer:
     def _batch_worker(self):
         """Enhanced worker thread that processes the queue with adaptive batching"""
         while not self.shutdown_flag:
-            # Only process once setup is complete
-            if not self.setup_complete:
-                time.sleep(0.1)
-                self._setup()  # Try to set up if not done
+            # Add debug logging to track queue size
+            if self.verbose and self.eval_queue.qsize() > 0:
+                logger.debug(f"Eval queue size: {self.eval_queue.qsize()}")
+            
+            # Wait for substantial batch or timeout
+            wait_start = time.time()
+            batch_target_time = wait_start + self.max_wait_time
+            min_batch_size = max(1, min(self.min_batch_size, self.batch_size // 2))
+            
+            # Determine batch collection strategy based on queue size
+            queue_size = self.eval_queue.qsize()
+            if queue_size >= self.batch_size:
+                # Queue has enough items for a full batch, collect it immediately
+                target_collect_size = min(self.batch_size, queue_size)
+                max_wait_time = 0.002  # Very short wait (2ms)
+            elif queue_size >= min_batch_size:
+                # Queue has enough for a minimum batch, wait a bit for more
+                target_collect_size = min(self.batch_size, queue_size)
+                max_wait_time = self.max_wait_time / 2
+            else:
+                # Queue has few items, wait longer for batch formation
+                target_collect_size = self.batch_size
+                max_wait_time = self.max_wait_time
+            
+            # Collect batch with timeout strategy
+            batch = []
+            batch_too_small = True
+            
+            # Try to collect first item
+            try:
+                item = self.eval_queue.get(timeout=max_wait_time)
+                batch.append(item)
+                batch_too_small = len(batch) < min_batch_size
+            except queue.Empty:
+                # No items available, sleep briefly and continue
+                time.sleep(0.001)
+                self.wait_times.append(time.time() - wait_start)
                 continue
-                
-            # Import torch only when needed
-            import torch
-                
-            states, futures = [], []
             
-            # Start timing for batch collection
-            batch_start_time = time.time()
-            batch_target_time = batch_start_time + self.current_batch_wait
+            # Now try to collect remaining items up to target size
+            collection_start = time.time()
+            collection_timeout = min(max_wait_time, batch_target_time - collection_start)
             
-            # Try to fill batch up to max_batch_size or until wait time expires
-            while len(states) < self.max_batch_size:
-                # Check if we've exceeded wait time
-                current_time = time.time()
-                if current_time >= batch_target_time and len(states) > 0:
-                    break
-                    
-                # Determine remaining wait time
-                remaining_wait = max(0, batch_target_time - current_time)
-                
-                # Process from highest priority queue to lowest with available items
-                request_processed = False
-                
-                for priority in range(3, -1, -1):  # From 3 (highest) to 0 (lowest)
-                    try:
-                        if not self.queues[priority].empty():
-                            state, future = self.queues[priority].get_nowait()
-                            states.append(state)
-                            futures.append(future)
-                            request_processed = True
-                            break  # Process one request at a time to check time again
-                    except queue.Empty:
-                        continue
-                
-                # If no request processed from any queue, wait a bit
-                if not request_processed:
-                    # If we already have some items, don't wait long
-                    if len(states) > 0:
-                        time.sleep(0.0001)  # 0.1ms
-                    else:
-                        time.sleep(0.001)  # 1ms
-            
-            # Record batch collection time
-            collection_time = time.time() - batch_start_time
-            self.batch_waits.append(collection_time)
-            
-            # If we have states to process
-            if states:
-                # Process batch through neural network
-                batch_size = len(states)
-                self.batch_sizes.append(batch_size)
-                self.batch_fullness.append(batch_size / self.max_batch_size)
-                
+            while len(batch) < target_collect_size and time.time() - collection_start < collection_timeout:
                 try:
-                    # Run inference
-                    inference_start = time.time()
-                    policy_batch, value_batch = self._perform_inference(states)
-                    inference_time = time.time() - inference_start
-                    self.inference_times.append(inference_time)
+                    # Use short timeout for remaining items
+                    item = self.eval_queue.get(timeout=0.001)
+                    batch.append(item)
                     
-                    # Return results through futures
-                    for i, future in enumerate(futures):
-                        if i < len(policy_batch) and i < len(value_batch):
-                            future.put((policy_batch[i], value_batch[i][0]))
-                        else:
-                            # Safety check - shouldn't happen but just in case
-                            future.put((np.ones(9)/9, 0.0))
-                    
-                    # Update adaptive batch wait if enabled
-                    if self.adaptive_batching:
-                        self._update_adaptive_batch_wait(batch_size)
-                        
-                except Exception as e:
-                    logger.error(f"Batch processing error: {e}")
-                    # Return default values on error
-                    default_policy = np.ones(9) / 9  # Uniform policy
-                    default_value = 0.0  # Neutral value
-                    
-                    for future in futures:
-                        future.put((default_policy, default_value))
+                    # Check if we have enough for minimum batch size
+                    if batch_too_small and len(batch) >= min_batch_size:
+                        batch_too_small = False
+                        # Since we have minimum, reduce remaining timeout
+                        collection_timeout = min(collection_timeout, 0.005)
+                except queue.Empty:
+                    # If we have minimum batch size, wait less
+                    if not batch_too_small:
+                        break
+                    time.sleep(0.0005)  # Very short sleep to avoid CPU spinning
             
-            # Track queue sizes for monitoring
-            total_queued = sum(q.qsize() for q in self.queues)
-            self.queue_sizes.append(total_queued)
+            wait_time = time.time() - wait_start
+            self.wait_times.append(wait_time)
+            
+            # Log batch collection stats
+            if self.verbose and len(batch) > 1:
+                logger.debug(f"Collected batch of {len(batch)} items in {wait_time*1000:.1f}ms")
+            
+            if not batch:
+                # No items collected, sleep briefly
+                time.sleep(0.001)
+                continue
+            
+            # Process batch
+            batch_size = len(batch)
+            self.batch_sizes.append(batch_size)
+            
+            # Extract states for inference
+            leaves, paths = zip(*batch)
+            states = [leaf.state for leaf in leaves]
+            
+            # Perform inference
+            inference_start = time.time()
+            try:
+                results = self._evaluate_batch(states)
+                inference_time = time.time() - inference_start
+                self.inference_times.append(inference_time)
+                
+                # Send results to result queue
+                for i, (leaf, path) in enumerate(zip(leaves, paths)):
+                    if i < len(results):
+                        result = results[i]
+                    else:
+                        # Fallback for mismatch
+                        result = (np.ones(9)/9, 0.0)
+                    
+                    self.result_queue.put((leaf, path, result))
+                
+                self.leaves_evaluated += batch_size
+                self.batches_evaluated += 1
+                
+                # Log successful batch processing
+                if self.verbose:
+                    avg_batch = sum(self.batch_sizes) / len(self.batch_sizes) if self.batch_sizes else 0
+                    if batch_size > 1 or self.batches_evaluated % 10 == 0:
+                        logger.debug(f"Processed batch {self.batches_evaluated}: size={batch_size}, " +
+                                f"avg_size={avg_batch:.1f}, time={inference_time*1000:.1f}ms")
+                
+            except Exception as e:
+                logger.error(f"Batch evaluation error: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Return default values on error
+                default_policy = np.ones(9) / 9  # Uniform policy
+                default_value = 0.0  # Neutral value
+                
+                for leaf, path in batch:
+                    self.result_queue.put((leaf, path, (default_policy, default_value)))
+                    
+        # Log final statistics on shutdown
+        logger.debug(f"Evaluator shutdown - processed {self.batches_evaluated} batches, " +
+                    f"avg size: {np.mean(self.batch_sizes) if self.batch_sizes else 0:.1f}")
     
     def _update_adaptive_batch_wait(self, current_batch_size):
         """Update batch wait time based on recent performance"""
         # Get batch fullness ratio
         batch_ratio = current_batch_size / self.max_batch_size
         
-        # If batches are too small, increase wait time to collect larger batches
-        if batch_ratio < self.target_batch_ratio:
+        # Measure queue growth rate
+        queue_growth = 0
+        if len(self.queue_sizes) >= 2:
+            queue_growth = self.queue_sizes[-1] - self.queue_sizes[-2]
+        
+        # If batches are too small and queue isn't growing rapidly
+        if batch_ratio < self.target_batch_ratio and queue_growth < 5:
             # Increase wait time, but not beyond max
             new_wait = min(
                 self.max_batch_wait,
                 self.current_batch_wait * (1 + self.adaptation_rate)
             )
-        # If batches are consistently full, decrease wait time to reduce latency
-        elif batch_ratio >= 0.95 and len(self.batch_fullness) > 5 and np.mean(list(self.batch_fullness)[-5:]) > 0.9:
+        # If batches are consistently full or queue is growing rapidly, decrease wait time
+        elif batch_ratio >= 0.95 or queue_growth > 10:
             # Decrease wait time, but not below min
             new_wait = max(
                 self.min_batch_wait,
@@ -607,7 +889,7 @@ class EnhancedBatchInferenceServer:
         # Update if changed significantly
         if abs(new_wait - self.current_batch_wait) / self.current_batch_wait > 0.05:
             logger.debug(f"Adjusting batch wait time: {self.current_batch_wait:.6f} → {new_wait:.6f} " +
-                        f"(batch ratio: {batch_ratio:.2f})")
+                        f"(batch ratio: {batch_ratio:.2f}, queue growth: {queue_growth})")
             self.current_batch_wait = new_wait
     
     def _monitoring_worker(self):
@@ -727,3 +1009,55 @@ class EnhancedBatchInferenceServer:
         if hasattr(self, 'monitoring_thread') and self.monitoring_thread.is_alive():
             self.monitoring_thread.join(timeout=1.0)
         logger.info("Inference server shutdown complete")
+        
+    def _profile_optimal_batch_size(self):
+        """Profile different batch sizes to find optimal for this GPU"""
+        if not self.setup_complete:
+            self._setup()
+            
+        import torch
+        
+        # Create dummy batch for testing
+        dummy_state = np.zeros((3, 3, 3), dtype=np.float32)  # Example state shape
+        
+        # Test different batch sizes
+        batch_sizes = [64, 128, 256, 512]
+        times = []
+        
+        for batch_size in batch_sizes:
+            # Create test batch
+            test_batch = [dummy_state] * batch_size
+            tensors = torch.tensor(np.stack(test_batch), dtype=torch.float32).to(self.device)
+            
+            # Warmup
+            for _ in range(5):
+                with torch.no_grad():
+                    if self.use_amp:
+                        with torch.amp.autocast(device_type='cuda'):
+                            self.model(tensors)
+                    else:
+                        self.model(tensors)
+                        
+            # Measure performance
+            start = time.time()
+            repeats = 20
+            
+            for _ in range(repeats):
+                with torch.no_grad():
+                    if self.use_amp:
+                        with torch.amp.autocast(device_type='cuda'):
+                            self.model(tensors)
+                    else:
+                        self.model(tensors)
+            
+            torch.cuda.synchronize()
+            end = time.time()
+            
+            times.append((end - start) / repeats)
+        
+        # Find optimal batch size (lowest time per sample)
+        throughputs = [size / time for size, time in zip(batch_sizes, times)]
+        optimal_idx = np.argmax(throughputs)
+        self.max_batch_size = batch_sizes[optimal_idx]
+        
+        logger.info(f"Optimal batch size for this GPU: {self.max_batch_size}")

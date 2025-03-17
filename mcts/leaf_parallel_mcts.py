@@ -9,6 +9,8 @@ import logging
 from typing import List, Dict, Tuple, Any, Optional, Set, Callable, Union
 from collections import deque
 
+from mcts.core import select_node_with_node_locks
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("LeafParallelMCTS")
@@ -67,6 +69,11 @@ class LeafParallelMCTS:
             'collection_success_rate': []
         }
         
+        # Tree health tracking
+        self.health_check_history = []
+        self.applied_fixes = []
+        self.parameter_adjustments = []
+        
         # Thread pool for collectors (alternative to individual threads)
         self.use_thread_pool = True  # Flag to control whether to use thread pool
         if self.use_thread_pool:
@@ -79,75 +86,186 @@ class LeafParallelMCTS:
         logger.info(f"LeafParallelMCTS initialized with {num_collectors} collectors, " +
                    f"batch_size={batch_size}, exploration_weight={exploration_weight}" +
                    (", adaptive parameters enabled" if adaptive_parameters else ""))
-    
-    def _adapt_parameters(self, root, sims_completed):
+            
+    def check_tree_health(self, root):
         """
-        Dynamically adjust MCTS parameters based on performance.
+        Perform a comprehensive tree health check to detect inconsistencies.
         
         Args:
             root: Root node of the search tree
-            sims_completed: Number of simulations completed so far
+            
+        Returns:
+            dict: Health check results with potential issues
         """
-        current_time = time.time()
+        health = {
+            "status": "healthy",
+            "issues": [],
+            "metrics": {}
+        }
         
-        # Only adapt every few seconds
-        if current_time - self.last_adaptation_time < self.adaptation_interval:
-            return
+        # Check child-parent visit consistency
+        child_visits = sum(child.visits for child in root.children) if root.children else 0
+        if root.visits < child_visits:
+            health["status"] = "inconsistent"
+            health["issues"].append({
+                "type": "visit_inconsistency",
+                "message": f"Root has {root.visits} visits but children have {child_visits} visits combined",
+                "severity": "critical"
+            })
             
-        self.last_adaptation_time = current_time
-        
-        if not self.adaptive_parameters:
-            return
+        # Check for extreme visit distribution skew
+        if root.children:
+            visits = [child.visits for child in root.children]
+            max_visits = max(visits)
+            min_visits = min(visits)
+            avg_visits = sum(visits) / len(visits)
+            health["metrics"]["visit_stats"] = {
+                "max": max_visits,
+                "min": min_visits,
+                "avg": avg_visits,
+                "std_dev": np.std(visits)
+            }
             
-        # Get statistics from various components
-        batch_sizes = []
-        if self.evaluator and hasattr(self.evaluator, 'batch_sizes'):
-            batch_sizes = list(self.evaluator.batch_sizes)
+            # If one child dominates, we might have poor exploration
+            if max_visits > 10 * avg_visits:
+                health["issues"].append({
+                    "type": "skewed_distribution",
+                    "message": f"Highly skewed visit distribution (max: {max_visits}, avg: {avg_visits:.1f})",
+                    "severity": "warning"
+                })
         
-        collection_success = []
-        for collector, _ in self.collectors:
-            if hasattr(collector, 'leaves_collected') and hasattr(collector, 'consecutive_empty_batches'):
-                if collector.consecutive_empty_batches < 10:
-                    collection_success.append(1.0)  # Success
-                else:
-                    collection_success.append(0.0)  # Failure
+        # Better detection of pending nodes buildup
+        if len(self.pending_nodes) > 20 and self.processor and self.processor.results_processed < 10:
+            health["issues"].append({
+                "type": "pending_nodes_buildup",
+                "message": f"{len(self.pending_nodes)} pending nodes but few results processed",
+                "severity": "warning"
+            })
         
-        # Calculate metrics
-        avg_batch_size = sum(batch_sizes) / max(1, len(batch_sizes)) if batch_sizes else 0
-        success_rate = sum(collection_success) / max(1, len(collection_success)) if collection_success else 0
+        # Check expansion rate
+        expanded_count = self._count_expanded_nodes(root)
+        total_nodes = self._count_nodes(root) 
+        expansion_ratio = expanded_count / max(1, total_nodes)
+        health["metrics"]["expansion_ratio"] = expansion_ratio
         
-        # Store in adaptation stats
-        self.adaptation_stats['batch_sizes'].append(avg_batch_size)
-        self.adaptation_stats['collection_success_rate'].append(success_rate)
+        if expansion_ratio > 0.9 and total_nodes > 20:
+            health["issues"].append({
+                "type": "high_expansion_ratio",
+                "message": f"Most nodes ({expanded_count}/{total_nodes}) are marked expanded",
+                "severity": "warning"
+            })
         
-        # Calculate adaptation direction
-        if avg_batch_size < self.min_batch_size / 2 and success_rate < 0.5:
-            # Tree exploration is challenging - reduce exploration weight
-            new_weight = max(0.8, self.exploration_weight * 0.9)
-            if abs(new_weight - self.exploration_weight) > 0.05:
-                logger.info(f"Reducing exploration weight: {self.exploration_weight:.2f} → {new_weight:.2f}")
-                self.exploration_weight = new_weight
+        # Calculate health score (0-100)
+        if health["status"] == "healthy" and not health["issues"]:
+            health["score"] = 100
+        else:
+            # Reduce score based on issue severity
+            score = 100
+            for issue in health["issues"]:
+                if issue["severity"] == "critical":
+                    score -= 50
+                elif issue["severity"] == "warning":
+                    score -= 15
+            health["score"] = max(0, score)
         
-        elif avg_batch_size > self.batch_size * 0.8 and success_rate > 0.8:
-            # Tree exploration is easy - can increase exploration weight
-            new_weight = min(2.5, self.exploration_weight * 1.1)
-            if abs(new_weight - self.exploration_weight) > 0.05:
-                logger.info(f"Increasing exploration weight: {self.exploration_weight:.2f} → {new_weight:.2f}")
-                self.exploration_weight = new_weight
+        return health
+
+    def apply_health_fixes(self, root, health):
+        """
+        Apply fixes based on tree health check results.
         
-        # Update collectors with new exploration weight
-        for collector, _ in self.collectors:
-            collector.exploration_weight = self.exploration_weight
+        Args:
+            root: Root node of the search tree
+            health: Health check results from check_tree_health()
+            
+        Returns:
+            list: Applied fixes
+        """
+        applied_fixes = []
+        
+        for issue in health["issues"]:
+            if issue["type"] == "visit_inconsistency":
+                # Correct visit counts
+                with root.node_lock:
+                    old_visits = root.visits
+                    new_visits = sum(child.visits for child in root.children)
+                    root.visits = max(new_visits, old_visits)
+                    fix = {"type": "visit_correction", "message": f"Corrected root visits from {old_visits} to {root.visits}"}
+                    applied_fixes.append(fix)
+                    logger.warning(fix["message"])
+            
+            elif issue["type"] == "pending_nodes_buildup":
+                # More aggressive clearing of pending nodes
+                pending_size = len(self.pending_nodes)
+                self.pending_nodes.clear()
+                fix = {"type": "pending_clear", "message": f"Cleared {pending_size} pending nodes to unblock search"}
+                applied_fixes.append(fix)
+                logger.warning(fix["message"])
+        
+        return applied_fixes
+
+    def adapt_search_parameters(self, root, health):
+        """
+        Adapt search parameters based on tree health and performance.
+        
+        Args:
+            root: Root node of the search tree
+            health: Health check results
+            
+        Returns:
+            dict: Parameter adjustments
+        """
+        adjustments = {}
+        
+        # Get current parameters
+        current_exploration = self.exploration_weight
+        
+        # If tree health is poor, make parameter adjustments
+        if health["score"] < 70:
+            # Extreme skew might indicate exploitation issues
+            if any(issue["type"] == "skewed_distribution" for issue in health["issues"]):
+                # Increase exploration to encourage broader search
+                new_exploration = min(2.5, current_exploration * 1.2)
+                if abs(new_exploration - current_exploration) > 0.05:
+                    self.exploration_weight = new_exploration
+                    adjustments["exploration_weight"] = {
+                        "old": current_exploration,
+                        "new": new_exploration,
+                        "reason": "Increasing exploration to address visit skew"
+                    }
+                    logger.info(f"Increasing exploration weight: {current_exploration:.2f} → {new_exploration:.2f}")
+        
+        # If we're making good progress but batch utilization is low
+        elif health["score"] >= 85 and hasattr(self.evaluator, 'batch_sizes'):
+            avg_batch_size = np.mean(self.evaluator.batch_sizes) if self.evaluator.batch_sizes else 0
+            if avg_batch_size < self.min_batch_size / 2:
+                # Tree is too deeply exploited - increase exploration
+                new_exploration = min(2.5, current_exploration * 1.15)
+                if abs(new_exploration - current_exploration) > 0.05:
+                    self.exploration_weight = new_exploration
+                    adjustments["exploration_weight"] = {
+                        "old": current_exploration,
+                        "new": new_exploration,
+                        "reason": "Increasing exploration to improve batch utilization"
+                    }
+                    logger.info(f"Increasing exploration weight: {current_exploration:.2f} → {new_exploration:.2f}")
+        
+        # Update collectors with new exploration weight if changed
+        if "exploration_weight" in adjustments:
+            for collector, _ in self.collectors:
+                collector.exploration_weight = self.exploration_weight
+        
+        return adjustments
     
     def search(self, root_state, num_simulations: int = 800, add_dirichlet_noise: bool = True) -> Tuple[Any, Dict]:
         """
-        Perform MCTS search from root state with performance monitoring.
+        Perform MCTS search from root state with performance monitoring and tree health checks.
         
         Args:
             root_state: Initial game state
             num_simulations: Number of simulations to run
             add_dirichlet_noise: Whether to add Dirichlet noise at root
-                
+                    
         Returns:
             Tuple: (root node, statistics dictionary)
         """
@@ -225,6 +343,13 @@ class LeafParallelMCTS:
         last_sims_count = 1
         stall_start_time = None
         
+        # Track health check metrics
+        last_health_check_time = time.time()
+        health_check_interval = 3.0  # Seconds between health checks
+        health_checks_performed = 0
+        parameter_adaptations = []
+        health_fixes_applied = []
+        
         try:
             while sims_completed < num_simulations:
                 # Check simulation progress
@@ -255,9 +380,42 @@ class LeafParallelMCTS:
                     stall_start_time = None
                     last_sims_count = sims_completed
                 
-                # Adapt parameters if enabled and enough time has passed
-                if hasattr(self, 'adaptive_parameters') and self.adaptive_parameters:
-                    self._adapt_parameters(root, sims_completed)
+                # Periodic tree health check with adaptive parameters
+                current_time = time.time()
+                if current_time - last_health_check_time > health_check_interval:
+                    # Run tree health check
+                    health = self.check_tree_health(root)
+                    health_checks_performed += 1
+                    
+                    # Log health summary if issues found
+                    if health["status"] != "healthy" or health["issues"]:
+                        issues_count = len(health["issues"])
+                        logger.info(f"Tree health check: score={health['status']}, score={health['score']}/100, {issues_count} issues")
+                    
+                    # Apply fixes if health score is low
+                    if health["score"] < 85:
+                        fixes = self.apply_health_fixes(root, health)
+                        health_fixes_applied.extend(fixes)
+                    
+                    # Adapt search parameters based on tree health
+                    adaptations = self.adapt_search_parameters(root, health)
+                    if adaptations:
+                        parameter_adaptations.append({
+                            "time": current_time - self.start_time,
+                            "adaptations": adaptations
+                        })
+                    
+                    # Update health check time
+                    last_health_check_time = current_time
+                    
+                    # Adjust health check interval based on health score
+                    # Check more frequently if health is poor
+                    if health["score"] < 70:
+                        health_check_interval = 1.0  # Check every second if health is poor
+                    elif health["score"] < 85:
+                        health_check_interval = 2.0  # Check every 2 seconds if health is moderate
+                    else:
+                        health_check_interval = 3.0  # Check every 3 seconds if health is good
                 
                 # Periodically log progress
                 current_time = time.time()
@@ -301,6 +459,13 @@ class LeafParallelMCTS:
         if hasattr(self, 'performance_report'):
             stats['performance'] = self.performance_report
         
+        # Add health checks information
+        stats['health_checks'] = {
+            'count': health_checks_performed,
+            'fixes_applied': health_fixes_applied,
+            'parameter_adaptations': parameter_adaptations
+        }
+        
         return root, stats
     
     def _start_workers(self, root):
@@ -316,11 +481,13 @@ class LeafParallelMCTS:
                     result_queue=self.result_queue,
                     lock=self.tree_lock,  # Pass tree_lock as 'lock' for backward compatibility
                     batch_size=max(1, self.batch_size // self.num_collectors),
+                    min_batch_size=self.min_batch_size,
                     max_queue_size=self.batch_size * 2,
                     exploration_weight=self.exploration_weight,
                     max_collection_time=self.collector_timeout,
                     expanded_nodes=self.expanded_nodes,
-                    pending_nodes=self.pending_nodes
+                    pending_nodes=self.pending_nodes,
+                    verbose=self.verbose
                 )
                 future = self.collector_pool.submit(collector.run)
                 self.collector_futures.append((collector, future))
@@ -338,7 +505,8 @@ class LeafParallelMCTS:
                     exploration_weight=self.exploration_weight,
                     max_collection_time=self.collector_timeout,
                     expanded_nodes=self.expanded_nodes,
-                    pending_nodes=self.pending_nodes
+                    pending_nodes=self.pending_nodes,
+                    verbose=self.verbose
                 )
                 thread = threading.Thread(
                     target=collector.run,
@@ -431,8 +599,17 @@ class LeafParallelMCTS:
         return count
     
     def _log_diagnostic_info(self, root):
-        """Enhanced diagnostic logging for MCTS stalls"""
+        """Enhanced diagnostic logging for MCTS stalls with tree health integration"""
         logger.warning("=== MCTS STALL DETECTED ===")
+        
+        # Run tree health check first
+        health = self.check_tree_health(root)
+        
+        # Log health status
+        if health["issues"]:
+            logger.warning(f"Tree health issues: {len(health['issues'])}")
+            for issue in health["issues"]:
+                logger.warning(f"- {issue['severity'].upper()}: {issue['message']}")
         
         # Root node analysis
         expandable = sum(1 for c in root.children if not c.is_expanded)
@@ -448,7 +625,7 @@ class LeafParallelMCTS:
             
             # Check for highly skewed visit distribution
             if max_visits > 10 * avg_visits:
-                logger.warning("⚠️ Visit distribution is highly skewed - may indicate policy issues")
+                logger.warning("Visit distribution is highly skewed - may indicate policy issues")
         
         # Queue and node tracking analysis
         logger.warning(f"Pending nodes: {len(self.pending_nodes)}")
@@ -477,12 +654,59 @@ class LeafParallelMCTS:
         # CRITICAL: Tree health check
         expanded_nodes_in_tree = self._count_expanded_nodes(root)
         if expanded_nodes_in_tree != len(self.expanded_nodes):
-            logger.warning(f"⚠️ Tree state mismatch: {expanded_nodes_in_tree} expanded nodes in tree, "
+            logger.warning(f"Tree state mismatch: {expanded_nodes_in_tree} expanded nodes in tree, "
                         f"but {len(self.expanded_nodes)} in tracking set")
         
-        # CRITICAL: Check for recovery opportunities
-        self._recover_from_stall(root)
-    
+        # CRITICAL: Apply tree health fixes and parameter adjustments when stalled
+        if health["score"] < 85:  # Health is not optimal
+            # Apply aggressive fixes during stalls
+            fixes = self.apply_health_fixes(root, health)
+            if fixes:
+                logger.warning(f"Applied {len(fixes)} health fixes to recover from stall:")
+                for fix in fixes:
+                    logger.warning(f"- {fix['message']}")
+            
+            # Apply more aggressive parameter adaptations during stalls
+            adaptations = self.adapt_search_parameters(root, health)
+            if adaptations:
+                for param, info in adaptations.items():
+                    logger.warning(f"Adjusted {param} from {info['old']:.2f} to {info['new']:.2f} - {info['reason']}")
+        else:
+            # If tree health is good but we're still stalled, use more targeted recovery
+            self._recover_from_stall(root)
+
+    def _recover_from_stall(self, root):
+        """Attempt to recover from stalled search"""
+        # If all root children are expanded but search is stalled
+        all_expanded = all(child.is_expanded for child in root.children) if root.children else False
+        
+        if all_expanded:
+            logger.warning("All root children are marked expanded but search is stalled")
+            
+            # Reset expansion state for children to enable further exploration
+            reset_count = 0
+            for child in root.children:
+                # Reset nodes with fewer visits than average to enable exploration
+                avg_visits = root.visits / max(1, len(root.children))
+                if child.visits < avg_visits * 0.7:
+                    child.is_expanded = False
+                    self.expanded_nodes.discard(id(child))
+                    reset_count += 1
+            
+            if reset_count > 0:
+                logger.warning(f"Reset expansion state of {reset_count} nodes to enable further exploration")
+        
+        # Increase exploration to try different paths
+        old_exploration = self.exploration_weight
+        new_exploration = min(2.5, old_exploration * 1.15)
+        if abs(new_exploration - old_exploration) > 0.1:
+            self.exploration_weight = new_exploration
+            logger.info(f"Increasing exploration weight: {old_exploration:.2f} → {new_exploration:.2f}")
+            
+            # Update collectors with new exploration weight
+            for collector, _ in self.collectors:
+                collector.exploration_weight = self.exploration_weight
+
     def _count_expanded_nodes(self, node):
         """Count expanded nodes in tree for diagnostic purposes"""
         if node is None:
@@ -493,31 +717,6 @@ class LeafParallelMCTS:
             count += self._count_expanded_nodes(child)
                 
         return count
-
-    def _recover_from_stall(self, root):
-        """
-        Attempt to recover from stalled search by clearing tracking sets
-        and resetting node states if necessary.
-        """
-        # If we have many pending nodes but few processed results, clear pending set
-        if len(self.pending_nodes) > 20 and self.processor and self.processor.results_processed < 100:
-            logger.warning("Clearing pending nodes set to recover from potential deadlock")
-            self.pending_nodes.clear()
-        
-        # Check for tree exploration issues - if children are all expanded but we're stuck
-        expandable = sum(1 for c in root.children if not c.is_expanded)
-        if expandable == 0 and len(root.children) > 0:
-            logger.warning("All root children are marked expanded but search is stalled - resetting expansion state")
-            for child in root.children:
-                # Only reset nodes with few visits
-                if child.visits < 5:
-                    child.is_expanded = False
-        
-        # Analyze expansion status of all nodes in tree
-        expanded_count = self._count_expanded_nodes(root)
-        if expanded_count > 0.9 * self.total_nodes and self.total_nodes > 10:
-            logger.warning(f"Over 90% of nodes ({expanded_count}/{self.total_nodes}) are marked expanded - "
-                        f"this may indicate an expansion tracking issue")
     
     def _log_search_summary(self, root):
         """Log search performance summary"""
@@ -610,13 +809,15 @@ class LeafCollector:
                 eval_queue,
                 result_queue,
                 lock,
-                batch_size=8,
+                batch_size=32,
+                min_batch_size=8,
                 max_queue_size=32,
                 exploration_weight=1.4,
                 max_collection_time=0.01,
-                select_func=None,
+                select_func=select_node_with_node_locks,
                 expanded_nodes=None,
-                pending_nodes=None):
+                pending_nodes=None,
+                verbose=False):
         """Initialize the leaf collector with all required attributes"""
         self.root = root
         self.eval_queue = eval_queue
@@ -624,6 +825,7 @@ class LeafCollector:
         self.tree_lock = lock  # Explicitly store as tree_lock
         self.lock = lock       # Keep for backward compatibility
         self.batch_size = batch_size
+        self.min_batch_size = min_batch_size
         self.max_queue_size = max_queue_size
         self.exploration_weight = exploration_weight
         self.max_collection_time = max_collection_time
@@ -633,7 +835,7 @@ class LeafCollector:
         self.pending_nodes = pending_nodes if pending_nodes is not None else set()
         
         # Use provided selection function or default
-        self.select_func = select_func or _default_select
+        self.select_func = select_func
         
         # Statistics
         self.leaves_collected = 0
@@ -643,6 +845,7 @@ class LeafCollector:
         
         # Control flags
         self.shutdown_flag = False
+        self.verbose = verbose
     
     def run(self):
         """Main worker loop for leaf collection"""
@@ -666,7 +869,7 @@ class LeafCollector:
                     self.consecutive_empty_batches = 0  # Reset counter
                     
                     # Add to evaluation queue
-                    for leaf, path in batch:
+                    for leaf, path, virtual_visits in batch:
                         self.eval_queue.put((leaf, path))
                 else:
                     # No leaves collected, log if this keeps happening
@@ -697,32 +900,30 @@ class LeafCollector:
         if target_size <= 0:
             # Queue is full, no point collecting more nodes
             return []
-        
+            
         # Track collection time
         start_time = time.time()
         
-        # CRITICAL FIX: Use a more dynamic retry strategy
-        max_retries = 100  # Increased from 50
+        # Use a more dynamic retry strategy with exponential backoff
+        max_retries = 20  # Reduced from 100 to avoid wasting time
         retries = 0
         
-        # CRITICAL FIX: Track already visited nodes during this collection
+        # Track already visited nodes during this collection
         visited_nodes = set()
         
-        # Get a snapshot of expanded and pending nodes to reduce lock contention
+        # Important: Get a snapshot of expanded and pending nodes
         with self.tree_lock:
             local_expanded = set(self.expanded_nodes)
             local_pending = set(self.pending_nodes)
         
-        # CRITICAL FIX: Allow some nodes to be bypassed for diversity
-        bypass_prob = 0.1  # 10% chance to bypass a valid node to increase diversity
-        
-        # Keep track of nodes seen but skipped for bypass
-        bypassed_nodes = []
-        
-        while len(batch) < target_size and (time.time() - start_time) < self.max_collection_time and retries < max_retries:
+        # Main collection loop with better time management
+        while (len(batch) < target_size and 
+            (time.time() - start_time) < self.max_collection_time and 
+            retries < max_retries):
+            
             try:
-                # Select a leaf node
-                leaf, path = self.select_func(self.root, self.exploration_weight)
+                # Use proper virtual loss tracking
+                leaf, path, virtual_losses = self.select_func(self.root, self.exploration_weight)
                 leaf_id = id(leaf)
                 
                 # Skip if we've already visited this node in this batch collection
@@ -733,75 +934,39 @@ class LeafCollector:
                 # Mark as visited to avoid checking the same node repeatedly
                 visited_nodes.add(leaf_id)
                 
-                # Handle terminal nodes - process immediately
+                # Handle terminal nodes immediately
                 if leaf.state.is_terminal():
-                    with self.tree_lock:  # Brief lock to get consistent result
+                    with self.tree_lock:
                         value = leaf.state.get_winner()
-                    self.result_queue.put((leaf, path, (value, None)))
+                    # Send directly to result queue with virtual loss info
+                    self.result_queue.put((leaf, path, (value, None), virtual_losses))
                     retries += 1
                     continue
                 
-                # Check node status
-                is_eligible = (not leaf.is_expanded and 
-                            leaf_id not in local_expanded and 
-                            leaf_id not in local_pending)
+                # Check node status with proper synchronization
+                is_eligible = False
+                with self.tree_lock:
+                    # Double-check status under lock
+                    is_eligible = (not leaf.is_expanded and 
+                                leaf_id not in self.expanded_nodes and 
+                                leaf_id not in self.pending_nodes)
+                    
+                    if is_eligible:
+                        # Add to pending set
+                        self.pending_nodes.add(leaf_id)
+                        # Add to batch
+                        batch.append((leaf, path, virtual_losses))
                 
-                # CRITICAL FIX: If node is eligible but we decide to bypass for diversity
-                if is_eligible and len(bypassed_nodes) < 5 and np.random.random() < bypass_prob:
-                    bypassed_nodes.append((leaf, path))
-                    retries += 1
-                    continue
-                
-                # If not eligible, retry
                 if not is_eligible:
                     retries += 1
-                    continue
-                
-                # Node is eligible, acquire lock to update tree state
-                with self.tree_lock:
-                    # Double-check status under lock (might have changed)
-                    if (leaf.is_expanded or 
-                        leaf_id in self.expanded_nodes or 
-                        leaf_id in self.pending_nodes):
-                        retries += 1
-                        continue
+                    # Apply short sleep to reduce contention
+                    if retries % 10 == 0:
+                        time.sleep(0.001)  # 1ms sleep every 10 retries
                     
-                    # Add to pending set
-                    self.pending_nodes.add(leaf_id)
-                    local_pending.add(leaf_id)
-                    
-                    # Add to batch
-                    batch.append((leaf, path))
-            
             except Exception as e:
                 logger.error(f"Error collecting node: {e}")
                 retries += 1
-        
-        # CRITICAL FIX: If batch is empty but we bypassed some nodes, use those
-        if not batch and bypassed_nodes:
-            logger.debug(f"Using {len(bypassed_nodes)} bypassed nodes after no eligible nodes found")
-            for leaf, path in bypassed_nodes[:target_size]:
-                leaf_id = id(leaf)
-                # Double-check status before using
-                with self.tree_lock:
-                    if not (leaf.is_expanded or 
-                            leaf_id in self.expanded_nodes or 
-                            leaf_id in self.pending_nodes):
-                        self.pending_nodes.add(leaf_id)
-                        batch.append((leaf, path))
-        
-        # Log retry stats
-        if retries >= max_retries and not batch:
-            # Only log detailed stats for the first few failures
-            if self.consecutive_empty_batches < 5:
-                logger.debug(f"Reached retry limit ({max_retries}) without finding valid nodes, "
-                        f"visited {len(visited_nodes)} unique nodes")
-                self.consecutive_empty_batches += 1
-            elif self.consecutive_empty_batches == 5:
-                logger.warning("Multiple empty batches, suppressing further messages")
-                self.consecutive_empty_batches += 1
-        else:
-            self.consecutive_empty_batches = 0
+                time.sleep(0.001)  # Short sleep to avoid tight loop
         
         return batch
     
@@ -963,6 +1128,7 @@ class Evaluator:
                             # Fallback for mismatch
                             result = (np.ones(9)/9, 0.0)
                         
+                        # Put the result in a standardized format - leaf, path, result (no virtual_visits)
                         self.result_queue.put((leaf, path, result))
                     
                     self.leaves_evaluated += batch_size
@@ -996,66 +1162,35 @@ class Evaluator:
                 time.sleep(0.01)
     
     def _collect_batch_from_queue(self):
-        """Collect a batch from the eval queue with improved batching strategy"""
+        """Collect batch with staggered timing to reduce contention"""
         batch = []
         
-        # Get current queue size for adaptive behavior
-        queue_size = self.eval_queue.qsize()
+        # Use progressive timeouts
+        if self.eval_queue.qsize() >= self.batch_size:
+            # Queue has enough items, collect quickly
+            timeout = 0.001  # 1ms
+            target_size = self.batch_size
+        else:
+            # Queue is building up, wait longer
+            timeout = 0.01  # 10ms
+            target_size = max(self.min_batch_size, self.eval_queue.qsize())
         
-        # Determine adaptive wait time based on queue conditions
-        target_wait_time = self.max_wait_time
-        if queue_size > self.batch_size / 2:
-            # Queue is filling up, wait longer for better batching
-            target_wait_time = min(0.05, self.max_wait_time * 2)  # Up to 50ms
+        # Try to collect the batch
+        start_time = time.time()
+        max_wait = 0.05  # 50ms max wait
         
-        # Try to get first item with longer timeout
-        try:
-            # Wait for first item with sufficient timeout
-            first_item_timeout = min(0.02, target_wait_time)  # At least 20ms
-            item = self.eval_queue.get(timeout=first_item_timeout)
-            batch.append(item)
-        except queue.Empty:
-            return []
-        
-        # Start timing batch collection
-        collection_start = time.time()
-        
-        # Determine target batch size based on queue dynamics
-        target_batch_size = max(
-            self.min_batch_size,  
-            min(self.batch_size, int(queue_size * 1.2) + 1)
-        )
-        
-        # Try to collect up to target_batch_size
-        while len(batch) < target_batch_size:
-            # Check if we've waited long enough
-            elapsed = time.time() - collection_start
-            
-            if elapsed > target_wait_time:
-                # If we have enough items, proceed
-                if len(batch) >= self.min_batch_size:
-                    break
-                # If we've waited extremely long but don't have minimum batch,
-                # proceed anyway if we have something
-                elif elapsed > target_wait_time * 2 and len(batch) > 0:
-                    break
-                
+        while len(batch) < target_size and time.time() - start_time < max_wait:
             try:
-                # Use small timeout instead of nowait for smoother collection
-                item = self.eval_queue.get(timeout=0.002)  # 2ms timeout
+                item = self.eval_queue.get(timeout=timeout)
                 batch.append(item)
+                # Reduce timeout as we collect more items
+                timeout = max(0.0005, timeout * 0.8)
             except queue.Empty:
-                # If we already have minimum batch size, don't wait too long
+                # If we have minimum batch size, proceed
                 if len(batch) >= self.min_batch_size:
                     break
-                
-                # Short sleep to avoid CPU spinning
-                time.sleep(0.002)  # 2ms
-        
-        # Log batch size periodically for debugging
-        if self.batch_sizes and (len(self.batch_sizes) % 20 == 0):
-            avg_size = sum(self.batch_sizes) / len(self.batch_sizes)
-            logger.debug(f"Average batch size: {avg_size:.2f}, current: {len(batch)}")
+                # Shorter timeouts for subsequent attempts
+                timeout = max(0.0005, timeout * 0.5)
         
         return batch
     
@@ -1123,7 +1258,7 @@ class Evaluator:
             "batches_evaluated": self.batches_evaluated,
             "leaves_evaluated": self.leaves_evaluated,
             "avg_batch_size": np.mean(self.batch_sizes) if self.batch_sizes else 0,
-            "avg_evaluation_time": np.mean(self.evaluation_times) if self.evaluation_times else 0,
+            # "avg_evaluation_time": np.mean(self.evaluation_times) if self.evaluation_times else 0,
             "avg_wait_time": np.mean(self.wait_times) if self.wait_times else 0,
             "current_queue_size": self.eval_queue.qsize()
         }
@@ -1163,14 +1298,26 @@ class ResultProcessor:
                 # Get result from queue with timeout
                 try:
                     wait_start = time.time()
-                    leaf, path, result = self.result_queue.get(timeout=0.01)  # 10ms timeout
+                    queue_item = self.result_queue.get(timeout=0.01)  # 10ms timeout
                     self.wait_times.append(time.time() - wait_start)
+                    
+                    # Unpack the queue item - handle different formats
+                    if len(queue_item) == 3:
+                        leaf, path, result = queue_item
+                        virtual_visits = None
+                    elif len(queue_item) == 4:
+                        leaf, path, result, virtual_visits = queue_item
+                    else:
+                        # Unexpected format - log and skip
+                        logger.error(f"Unexpected result queue item format: {queue_item}")
+                        continue
+                        
                 except queue.Empty:
                     continue
                 
                 # Process result
                 processing_start = time.time()
-                success = self._process_result(leaf, path, result)
+                success = self._process_result(leaf, path, result, virtual_visits)
                 self.processing_times.append(time.time() - processing_start)
                 if success:
                     self.results_processed += 1
@@ -1184,70 +1331,48 @@ class ResultProcessor:
                 # Short sleep to avoid error flooding
                 time.sleep(0.01)  # 10ms
     
-    def _process_result(self, leaf, path, result):
-        """Process evaluation result with fixed backpropagation"""
+    def _process_result(self, leaf, path, result, virtual_visits=None):
+        """Process evaluation result with proper virtual loss handling"""
         from mcts.core import expand_node, backpropagate
         
+        virtual_visits = virtual_visits or {}
         leaf_id = id(leaf)
         
         with self.lock:
+            # Always remove from pending
+            self.pending_nodes.discard(leaf_id)
+            
+            # Skip if already expanded, but still backpropagate
+            if leaf.is_expanded or leaf_id in self.expanded_nodes:
+                if isinstance(result, tuple) and len(result) == 2:
+                    _, value = result
+                    backpropagate(path, value)  # Use simplified backpropagation
+                return True
+            
+            # Handle terminal states
+            if leaf.state.is_terminal():
+                value = leaf.state.get_winner()
+                backpropagate(path, value)
+                return True
+                
+            # Handle normal evaluation
             try:
-                # Remove from pending set
-                self.pending_nodes.discard(leaf_id)
+                policy, value = result
                 
-                # Skip if node is already expanded
-                if leaf.is_expanded or leaf_id in self.expanded_nodes:
-                    return True
+                # Expand leaf with the policy
+                expand_node(leaf, policy)
                 
-                # Check if this is a terminal node result
-                if isinstance(result, tuple) and len(result) == 2 and result[1] is None:
-                    # Just backpropagate the game result
-                    value = result[0]
-                    backpropagate(path, value)
-                    return True
+                # Mark as expanded
+                leaf.is_expanded = True
+                self.expanded_nodes.add(leaf_id)
                 
-                # Handle normal evaluation result
-                try:
-                    # Standard format: (policy, value)
-                    policy, value = result
-                    
-                    # CRITICAL FIX: Check if leaf is a valid node with policy
-                    if len(policy) == 0 or np.sum(policy) == 0:
-                        logger.warning("Empty policy received, using uniform policy")
-                        legal_actions = leaf.state.get_legal_actions()
-                        if legal_actions:
-                            policy = np.zeros(9)  # Assuming TicTacToe
-                            for a in legal_actions:
-                                policy[a] = 1.0 / len(legal_actions)
-                    
-                    # Expand leaf node with the policy
-                    expand_node(leaf, policy)
-                    
-                    # Mark as expanded
-                    leaf.is_expanded = True
-                    self.expanded_nodes.add(leaf_id)
-                    
-                    # Backpropagate the value
-                    backpropagate(path, value)
-                    return True
-                    
-                except ValueError:
-                    # Try value, policy format as fallback
-                    try:
-                        value, policy = result
-                        expand_node(leaf, policy)
-                        leaf.is_expanded = True
-                        self.expanded_nodes.add(leaf_id)
-                        backpropagate(path, value)
-                        return True
-                    except Exception as e2:
-                        logger.error(f"Failed alternative result processing: {e2}")
-                        raise
+                # Backpropagate the value
+                backpropagate(path, value)
+                return True
             except Exception as e:
                 logger.error(f"Error processing result: {e}")
-                self.errors += 1
                 return False
-    
+        
     def shutdown(self):
         """Signal the worker to shut down"""
         self.shutdown_flag = True
@@ -1499,90 +1624,9 @@ class MCTSPerformanceMonitor:
         
         return report
 
-def select_node_with_node_locks(node, exploration_weight=1.4):
-    """
-    Select a leaf node using PUCT algorithm with node-level locking.
-    
-    Args:
-        node: Root node to start selection from
-        exploration_weight: Controls exploration vs exploitation tradeoff
-        
-    Returns:
-        tuple: (leaf_node, path) - selected leaf node and path from root
-    """
-    path = [node]
-    
-    while True:
-        # Acquire node lock for reading
-        with node.node_lock:
-            # If node is a leaf (not expanded) or has no children, we're done
-            if not node.is_expanded or not node.children:
-                return node, path
-                
-            # Find best child according to UCB formula
-            best_score = float('-inf')
-            best_child = None
-            
-            for child in node.children:
-                # Skip if no visits (shouldn't happen normally)
-                if child.visits == 0:
-                    # Prioritize unexplored nodes
-                    score = float('inf')
-                else:
-                    # PUCT formula
-                    q_value = child.value / child.visits
-                    u_value = exploration_weight * child.prior * np.sqrt(node.visits) / (1 + child.visits)
-                    score = q_value + u_value
-                
-                if score > best_score:
-                    best_score = score
-                    best_child = child
-        
-        # Move to the best child (outside of lock)
-        node = best_child
-        path.append(node)
-        
-        # Apply virtual loss to discourage other threads selecting same path
-        with node.node_lock:
-            node.visits += 1  # Virtual visit
-            node.value -= 0.1  # Small negative bias
-
-# Update default select function to use this version
-def _default_select(node, exploration_weight=1.4):
-    """Default selection function with node-level locking"""
-    # Use node-level locking by default
-    if hasattr(node, 'node_lock'):
-        return select_node_with_node_locks(node, exploration_weight)
-    else:
-        # Fall back to standard selection if nodes don't have locks
-        from mcts.core import select_node
-        return select_node(node, exploration_weight)
-
-def _random_select(node):
-    """Random traversal to increase diversity"""
-    path = [node]
-    
-    while node.children:
-        # Randomly select child, weighted by prior probability
-        priors = np.array([child.prior for child in node.children])
-        # Ensure sum is 1
-        priors = priors / np.sum(priors) if np.sum(priors) > 0 else np.ones(len(priors)) / len(priors)
-        
-        # Sample index
-        try:
-            idx = np.random.choice(len(node.children), p=priors)
-            node = node.children[idx]
-        except:
-            # Fallback to uniform random selection
-            idx = np.random.randint(0, len(node.children))
-            node = node.children[idx]
-        
-        path.append(node)
-    
-    return node, path
-
 def get_optimal_collector_count():
     """Determine optimal number of collector threads based on CPU cores"""
+    import multiprocessing
     cpu_count = multiprocessing.cpu_count()
     # For Ryzen 9 5900X with 12 cores / 24 threads:
     # Use 75% of logical cores, leaving some for the main process and system
